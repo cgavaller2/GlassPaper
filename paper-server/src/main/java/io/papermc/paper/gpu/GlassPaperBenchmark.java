@@ -20,6 +20,11 @@ public final class GlassPaperBenchmark {
     private static final AtomicLong cpuCalls        = new AtomicLong();
     private static final AtomicLong cpuTotalNanos   = new AtomicLong();
 
+    private static final AtomicLong batchFlushes     = new AtomicLong();
+    private static final AtomicLong batchTotalPoints  = new AtomicLong();
+    private static long             largestBatch      = 0;
+    private static final Object     batchLock         = new Object();
+
     private GlassPaperBenchmark() {}
 
     public static void recordGpu(long nanos, int points) {
@@ -48,6 +53,16 @@ public final class GlassPaperBenchmark {
         LOGGER.info("[GlassPaper] ════════════════════════════════════════");
         LOGGER.info("[GlassPaper]        GlassPaper Benchmark Report      ");
         LOGGER.info("[GlassPaper] ════════════════════════════════════════");
+
+        long bf = batchFlushes.get();
+        if (bf > 0) {
+            LOGGER.info(String.format("[GlassPaper] Batch flushes    : %,d", bf));
+            LOGGER.info(String.format("[GlassPaper] Avg batch size   : %.0f points",
+                batchTotalPoints.get() / (double) bf));
+            synchronized (batchLock) {
+                LOGGER.info(String.format("[GlassPaper] Largest batch    : %,d points", largestBatch));
+            }
+        }
 
         if (gCalls > 0) {
             double avgGpuMs   = (gNanos / (double) gCalls) / 1_000_000.0;
@@ -87,6 +102,9 @@ public final class GlassPaperBenchmark {
         gpuTotalPoints.set(0);
         cpuCalls.set(0);
         cpuTotalNanos.set(0);
+        batchFlushes.set(0);
+        batchTotalPoints.set(0);
+        synchronized (batchLock) { largestBatch = 0; }
         LOGGER.info("[GlassPaper] Benchmark counters reset.");
     }
 
@@ -95,6 +113,14 @@ public final class GlassPaperBenchmark {
 
     public static void recordFunctionType(String type) {
         functionTypes.computeIfAbsent(type, k -> new AtomicLong()).incrementAndGet();
+    }
+
+    public static void recordBatchFlush(int points) {
+        batchFlushes.incrementAndGet();
+        batchTotalPoints.addAndGet(points);
+        synchronized (batchLock) {
+            if (points > largestBatch) largestBatch = points;
+        }
     }
 
 }

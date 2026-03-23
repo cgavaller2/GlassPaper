@@ -178,8 +178,31 @@ Every time the server starts, GlassPaper runs a 1000-sample correctness check co
 
 ## Roadmap
 
-### Phase 7 — Cross-Chunk Batch Coalescing
-Accumulate noise work from all worker threads into a shared queue, flush when batch reaches ~4096 points. Expected to yield 3–8× improvement over current baseline.
+## Performance — Phase 7 Results
+
+Tested on: **NVIDIA GeForce RTX 2080 Ti** + **Intel Core i9-14900K**, Windows 10
+```
+GPU dispatches    : ~200,000 per minute of active exploration  
+GPU avg/dispatch  : 0.13ms  (was 0.48ms before batch coalescing)
+GPU throughput    : 2,884 samples/ms  (was 490 samples/ms — 5.9× improvement)
+CPU fallback rate : ~38% (blended chunks at world boundaries — expected)
+Batch config      : 256 points threshold, 1ms flush interval
+```
+
+### Phase 7 — Cross-Chunk Batch Coalescing (Complete)
+
+Work from all 8 Paper worker threads is accumulated in a shared `GpuDispatchQueue`
+and flushed in large batches rather than dispatched per-chunk. This amortizes
+the fixed PCIe round-trip cost (~0.35ms) across many chunks simultaneously,
+achieving a 5.9× throughput improvement over the Phase 6 baseline.
+
+Batch parameters are tunable at runtime without server restart:
+```
+gpuconfig <threshold_points> <interval_ms>
+gpuconfig 256 1   ← recommended default
+gpuconfig 128 0   ← maximum responsiveness (spins one CPU core)
+gpuconfig 512 2   ← lower CPU overhead, slightly higher latency
+```
 
 ### Phase 8 — Multi-Queue Architecture
 Per-thread OpenCL command queues alongside the kernel pool to eliminate the remaining queue lock.

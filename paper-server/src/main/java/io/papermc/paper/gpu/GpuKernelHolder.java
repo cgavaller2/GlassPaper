@@ -6,6 +6,11 @@ public final class GpuKernelHolder {
 
     private static volatile GpuNoiseKernel instance = null;
 
+    private static volatile GpuDispatchQueue dispatchQueue;
+
+    public static void setDispatchQueue(GpuDispatchQueue queue) { dispatchQueue = queue; }
+    public static GpuDispatchQueue getDispatchQueue()           { return dispatchQueue;  }
+
     // Content-keyed cache: identical compiled trees → one GPU buffer set
     private static final ConcurrentHashMap<DfCacheKey, GpuCompiledKernel>
         gpuKernelCache = new ConcurrentHashMap<>();
