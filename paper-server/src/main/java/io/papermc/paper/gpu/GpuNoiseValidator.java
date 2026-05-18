@@ -25,7 +25,7 @@ public final class GpuNoiseValidator {
     private static final double EPSILON = 1e-9;
 
     public static boolean validate(GpuNoiseKernel kernel) {
-        LOGGER.info("[GlassPaper] Running GPU noise validation (" + SAMPLE_COUNT + " samples)...");
+        LOGGER.info("Running GPU noise validation (" + SAMPLE_COUNT + " samples)...");
 
         // 1. Create a deterministic ImprovedNoise instance
         RandomSource rng = RandomSource.create(12345L);
@@ -49,7 +49,7 @@ public final class GpuNoiseValidator {
             yo = (double) yoField.get(cpuNoise);
             zo = (double) zoField.get(cpuNoise);
         } catch (Exception e) {
-            LOGGER.severe("[GlassPaper] Validation failed — could not reflect ImprovedNoise: " + e.getMessage());
+            LOGGER.severe("Validation failed — could not reflect ImprovedNoise: " + e.getMessage());
             return false;
         }
 
@@ -88,7 +88,7 @@ public final class GpuNoiseValidator {
                 failures++;
                 if (failures <= 5) { // log first 5 failures in detail
                     LOGGER.severe(String.format(
-                        "[GlassPaper] MISMATCH at sample %d: pos=(%.4f,%.4f,%.4f) cpu=%.15f gpu=%.15f delta=%.2e",
+                        "MISMATCH at sample %d: pos=(%.4f,%.4f,%.4f) cpu=%.15f gpu=%.15f delta=%.2e",
                         i,
                         positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
                         cpuResults[i], gpuResults[i], delta
@@ -100,13 +100,13 @@ public final class GpuNoiseValidator {
         // 6. Report
         if (failures == 0) {
             LOGGER.info(String.format(
-                "[GlassPaper] Validation PASSED. %d samples, max delta = %.2e",
+                "Validation PASSED. %d samples, max delta = %.2e",
                 SAMPLE_COUNT, maxDelta
             ));
             return true;
         } else {
             LOGGER.severe(String.format(
-                "[GlassPaper] Validation FAILED. %d/%d samples mismatched, max delta = %.2e",
+                "Validation FAILED. %d/%d samples mismatched, max delta = %.2e",
                 failures, SAMPLE_COUNT, maxDelta
             ));
             return false;
@@ -117,7 +117,7 @@ public final class GpuNoiseValidator {
      * Validates the full NormalNoise GPU path against CPU reference.
      */
     public static boolean validateNormalNoise(GpuNoiseKernel kernel) {
-        LOGGER.info("[GlassPaper] Running NormalNoise GPU validation (" + SAMPLE_COUNT + " samples)...");
+        LOGGER.info("Running NormalNoise GPU validation (" + SAMPLE_COUNT + " samples)...");
 
         try {
             // Create a real NormalNoise the same way Minecraft does
@@ -153,7 +153,7 @@ public final class GpuNoiseValidator {
                     failures++;
                     if (failures <= 5) {
                         LOGGER.severe(String.format(
-                            "[GlassPaper] NormalNoise MISMATCH at sample %d: cpu=%.15f gpu=%.15f delta=%.2e",
+                            "NormalNoise MISMATCH at sample %d: cpu=%.15f gpu=%.15f delta=%.2e",
                             i, cpuResults[i], gpuResults[i], delta));
                     }
                 }
@@ -161,23 +161,23 @@ public final class GpuNoiseValidator {
 
             if (failures == 0) {
                 LOGGER.info(String.format(
-                    "[GlassPaper] NormalNoise validation PASSED. %d samples, max delta = %.2e",
+                    "NormalNoise validation PASSED. %d samples, max delta = %.2e",
                     SAMPLE_COUNT, maxDelta));
                 return true;
             } else {
                 LOGGER.severe(String.format(
-                    "[GlassPaper] NormalNoise validation FAILED. %d/%d mismatched, max delta = %.2e",
+                    "NormalNoise validation FAILED. %d/%d mismatched, max delta = %.2e",
                     failures, SAMPLE_COUNT, maxDelta));
                 return false;
             }
         } catch (Exception e) {
-            LOGGER.severe("[GlassPaper] NormalNoise validation exception: " + e.getMessage());
+            LOGGER.severe("NormalNoise validation exception: " + e.getMessage());
             return false;
         }
     }
 
     public static boolean validateBlendedNoise(GpuNoiseKernel kernel) {
-        LOGGER.info("[GlassPaper] Running BlendedNoise GPU validation (10000 samples)...");
+        LOGGER.info("Running BlendedNoise GPU validation (10000 samples)...");
         try {
             net.minecraft.util.RandomSource rng = net.minecraft.util.RandomSource.create(12345L);
             net.minecraft.world.level.levelgen.synth.BlendedNoise bn =
@@ -197,7 +197,7 @@ public final class GpuNoiseValidator {
                     .compileBlendedNoiseTestTree(bn, dummy1, dummy2);
 
             if (cdf == null) {
-                LOGGER.severe("[GlassPaper] BlendedNoise validation: compile failed");
+                LOGGER.severe("BlendedNoise validation: compile failed");
                 return false;
             }
 
@@ -236,7 +236,7 @@ public final class GpuNoiseValidator {
                     failures++;
                     if (failures <= 5) {
                         LOGGER.severe(String.format(
-                            "[GlassPaper] BlendedNoise MISMATCH pos=(%.0f,%.0f,%.0f) " +
+                            "BlendedNoise MISMATCH pos=(%.0f,%.0f,%.0f) " +
                                 "cpu=%.10f gpu=%.10f delta=%.3e",
                             positions[i*3], positions[i*3+1], positions[i*3+2],
                             cpuResults[i], gpuResults[i], delta));
@@ -246,16 +246,16 @@ public final class GpuNoiseValidator {
 
             if (failures == 0) {
                 LOGGER.info(String.format(
-                    "[GlassPaper] BlendedNoise validation PASSED. max delta = %.2e", maxDelta));
+                    "BlendedNoise validation PASSED. max delta = %.2e", maxDelta));
                 return true;
             } else {
                 LOGGER.severe(String.format(
-                    "[GlassPaper] BlendedNoise validation FAILED. %d/100 mismatched, " +
+                    "BlendedNoise validation FAILED. %d/100 mismatched, " +
                         "max delta = %.2e", failures, maxDelta));
                 return false;
             }
         } catch (Exception e) {
-            LOGGER.severe("[GlassPaper] BlendedNoise validation exception: " + e.getMessage());
+            LOGGER.severe("BlendedNoise validation exception: " + e.getMessage());
             e.printStackTrace();
             return false;
         }

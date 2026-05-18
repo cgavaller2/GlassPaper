@@ -70,7 +70,7 @@ public final class NormalNoiseGpuData {
             improvedNoise_zo              = field(ImprovedNoise.class, "zo");
             noiseHolder_noise             = field(DensityFunction.NoiseHolder.class, "noise");
         } catch (Exception e) {
-            throw new RuntimeException("[GlassPaper] Failed to cache NormalNoise reflection fields", e);
+            throw new RuntimeException("Failed to cache NormalNoise reflection fields", e);
         }
     }
 

@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Mon, 18 May 2026 13:13:04 -0500
+Subject: [PATCH] GlassPaper: Phase 9.1 cache-key fix and validation
+ diagnostics
+
+
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index 7547f545a934aacb78b75c68412f4b6a72c7ec1c..6db614169ddf887a885e4df14a3193851b713662 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -607,6 +607,18 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             return;
+         }
+ 
++        if (msg.equalsIgnoreCase("gpuvalidate")) {
++            boolean now = !io.papermc.paper.gpu.GlassPaperBenchmark.isValidating();
++            io.papermc.paper.gpu.GlassPaperBenchmark.setValidating(now);
++            if (now) {
++                LOGGER.info("GPU validation ON. Every 16th sample point is now diffed against CPU.");
++                LOGGER.info("Generate fresh terrain, then run gpubench. Toggle off with gpuvalidate again.");
++            } else {
++                LOGGER.info("GPU validation OFF.");
++            }
++            return;
++        }
++
+         // Paper end - rewrite chunk system
+         this.serverCommandQueue.add(new ConsoleInput(msg, source)); // Paper - Perf: use proper queue
+     }
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+index 2959f89cffa860400ccd607be8f27cc1bfa0f2eb..14d396386b7c64bbc1270ea2a22208df0f2e69f2 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -95,7 +95,7 @@ public final class DensityFunctionCompiler {
+             blendedNoise_yFactor             = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "yFactor");
+             blendedNoise_smearScaleMultiplier= field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "smearScaleMultiplier");
+         } catch (Exception e) {
+-            throw new RuntimeException("[GlassPaper] DensityFunctionCompiler reflection init failed", e);
++            throw new RuntimeException("DensityFunctionCompiler reflection init failed", e);
+         }
+     }
+ 
+@@ -111,11 +111,20 @@ public final class DensityFunctionCompiler {
+      * Attempt to compile the given density function.
+      * Returns null if any node is unsupported.
+      */
++    // Reasons we've already warned about, to avoid per-chunk spam. Compile
++    // failures still get counted in GlassPaperBenchmark.recordCompileFailure
++    // regardless of whether they were logged — the report shows totals.
++    private static final java.util.Set<String> loggedFailures =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
++
+     public static CompiledDensityFunction compile(DensityFunction fn) {
+         DensityFunctionCompiler c = new DensityFunctionCompiler();
+         c.emit(fn);
+         if (c.failed) {
+-            LOGGER.warning("[GlassPaper] DensityFunctionCompiler failed: " + c.failReason);
++            if (loggedFailures.add(c.failReason)) {
++                LOGGER.warning("DensityFunctionCompiler failed: " + c.failReason
++                    + " (further occurrences will be counted silently — see gpubench)");
++            }
+             return null;
+         }
+         c.iOps.add(DfOpcode.HALT);
+@@ -407,7 +416,15 @@ public final class DensityFunctionCompiler {
+             if (nn == null) { fail("WeirdScaledSampler: NormalNoise not initialized"); return; }
+             int idx = registerNoise(nn);
+             if (failed) return;
+-            int mapperType = ws.rarityValueMapper().name().equals("TYPE1") ? 0 : 1;
++            // Fail-closed on unknown mapper names. The two GPU mappers
++            // (TYPE1 = 3D rarity, TYPE2 = 2D rarity) match vanilla's
++            // NoiseRouterData.QuantizedSpaghettiRarity step functions —
++            // anything else would silently produce wrong terrain.
++            String mapperName = ws.rarityValueMapper().name();
++            int mapperType;
++            if (mapperName.equals("TYPE1"))      mapperType = 0;
++            else if (mapperName.equals("TYPE2")) mapperType = 1;
++            else { fail("WeirdScaledSampler: unknown rarity mapper " + mapperName); return; }
+             emit(ws.input());
+             iOps.add(DfOpcode.WEIRD_SCALED_SAMPLER);
+             iOps.add(idx);
+@@ -697,7 +714,7 @@ public final class DensityFunctionCompiler {
+             });
+ 
+             LOGGER.info(String.format(
+-                "[GlassPaper] BlendedNoise registered: idx=%d " +
++                "BlendedNoise registered: idx=%d " +
+                     "minOff=%d minCnt=%d maxOff=%d maxCnt=%d mainOff=%d mainCnt=%d " +
+                     "xzMul=%.4f yMul=%.4f xzFac=%.4f yFac=%.4f smear=%.4f",
+                 idx, minOff, minLevels.length, maxOff, maxLevels.length,
+@@ -783,13 +800,13 @@ public final class DensityFunctionCompiler {
+ 
+         // Register dummy1 directly — bypasses emit() disabled check
+         int idx1 = c.registerBlendedNoise(dummy1);
+-        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (dummy1): " + c.failReason); return null; }
++        if (c.failed) { LOGGER.warning("BlendedNoise test tree failed (dummy1): " + c.failReason); return null; }
+         c.iOps.add(DfOpcode.BLENDED_NOISE);
+         c.iOps.add(idx1);
+ 
+         // Register dummy2
+         int idx2 = c.registerBlendedNoise(dummy2);
+-        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (dummy2): " + c.failReason); return null; }
++        if (c.failed) { LOGGER.warning("BlendedNoise test tree failed (dummy2): " + c.failReason); return null; }
+         c.iOps.add(DfOpcode.BLENDED_NOISE);
+         c.iOps.add(idx2);
+ 
+@@ -797,7 +814,7 @@ public final class DensityFunctionCompiler {
+ 
+         // Register real bn
+         int idx3 = c.registerBlendedNoise(bn);
+-        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (bn): " + c.failReason); return null; }
++        if (c.failed) { LOGGER.warning("BlendedNoise test tree failed (bn): " + c.failReason); return null; }
+         c.iOps.add(DfOpcode.BLENDED_NOISE);
+         c.iOps.add(idx3);
+ 
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index 0c0dffc73d9b012527536b5603b345ab4177a3d0..df80c395a0b55f36eec88b56a60166950e4e812c 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -347,6 +347,29 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+                         double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
+                         System.arraycopy(results, zi * yLevels, slice, 0, yLevels);
+                     }
++                    // Runtime CPU/GPU validation, gated by the `gpuvalidate` flag.
++                    // Samples every 16th point; CPU evaluation against SinglePointContext
++                    // bypasses NoiseChunk caching state so the result is a clean baseline.
++                    if (io.papermc.paper.gpu.GlassPaperBenchmark.isValidating()) {
++                        DensityFunction validateFn = interp.wrapped();
++                        String typeName = validateFn.getClass().getSimpleName();
++                        for (int p = 0; p < pointsPerInterp; p += 16) {
++                            double px = positions[p * 3];
++                            double py = positions[p * 3 + 1];
++                            double pz = positions[p * 3 + 2];
++                            double cpuVal = validateFn.compute(
++                                new DensityFunction.SinglePointContext((int) px, (int) py, (int) pz));
++                            double gpuVal = results[p];
++                            double delta = Math.abs(cpuVal - gpuVal);
++                            io.papermc.paper.gpu.GlassPaperBenchmark.recordSampleChecked(typeName);
++                            if (delta > 1e-6) {
++                                io.papermc.paper.gpu.GlassPaperBenchmark.recordMismatch(
++                                    typeName, delta, (int) px, (int) py, (int) pz, cpuVal, gpuVal);
++                                io.papermc.paper.gpu.GlassPaperBenchmark.diagnoseRangeChoice(
++                                    validateFn, px, py, pz, cpuVal, gpuVal);
++                            }
++                        }
++                    }
+                 } else {
+                     // GPU timed out — fall back to CPU for this interpolator
+                     for (int zi = 0; zi < zColumns; zi++) {

@@ -55,7 +55,7 @@ public final class GpuDispatchQueue {
         this.flusherThread.start();
 
         LOGGER.info(String.format(
-            "[GlassPaper] GPU dispatch queue started (threshold=%d points, interval=%dms)",
+            "GPU dispatch queue started (threshold=%d points, interval=%dms)",
             flushThreshold, flushIntervalMs));
     }
 
@@ -77,14 +77,14 @@ public final class GpuDispatchQueue {
             }
         }
 
-        // Block until flusher completes this item
+        // Block until flusher completes this item. Returns null for:
+        //   - real timeout (GPU overloaded)
+        //   - flusher caught a dispatch exception (completed with null)
+        //   - shutdown drained this item
+        // In every null case the caller must fall back to CPU.
         try {
-            double[] result = item.future.get(50, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (result != null) return result;
-            // Timed out — return null so caller falls back to CPU
-            return null;
+            return item.future.get(50, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
-            // GPU is overloaded — signal CPU fallback
             return null;
         } catch (Exception e) {
             return null;
@@ -98,7 +98,7 @@ public final class GpuDispatchQueue {
         this.flushThreshold  = newThreshold;
         this.flushIntervalMs = newIntervalMs;
         LOGGER.info(String.format(
-            "[GlassPaper] GPU dispatch queue reconfigured (threshold=%d, interval=%dms)",
+            "GPU dispatch queue reconfigured (threshold=%d, interval=%dms)",
             newThreshold, newIntervalMs));
     }
 
@@ -114,10 +114,11 @@ public final class GpuDispatchQueue {
         try {
             flusherThread.join(2000);
         } catch (InterruptedException ignored) {}
-        // Complete any remaining futures with empty results to unblock waiting threads
+        // Unblock waiting workers with a CPU-fallback signal — null tells
+        // submit() to return null so the caller runs the work on CPU.
         GpuWorkItem item;
         while ((item = pendingQueue.poll()) != null) {
-            item.future.complete(new double[item.count]);
+            item.future.complete(null);
         }
     }
 
@@ -186,10 +187,13 @@ public final class GpuDispatchQueue {
                 mergedResults = kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints);
                 GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
             } catch (Exception e) {
-                LOGGER.warning("[GlassPaper] GPU batch dispatch failed: " + e.getMessage());
-                // Complete all futures with zeros so workers unblock
+                LOGGER.warning("GPU batch dispatch failed: " + e.getMessage());
+                // Signal CPU fallback to each waiting worker. Zero-filling the
+                // result here would silently corrupt terrain — the caller
+                // interprets a non-null array as a successful GPU dispatch and
+                // copies it straight into the interpolator slice.
                 for (GpuWorkItem w : group) {
-                    w.future.complete(new double[w.count]);
+                    w.future.complete(null);
                 }
                 continue;
             }

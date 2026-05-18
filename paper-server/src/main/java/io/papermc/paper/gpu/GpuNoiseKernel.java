@@ -28,16 +28,16 @@ public final class GpuNoiseKernel {
     public static GpuNoiseKernel build() {
         GpuContext ctx = GpuContext.get();
         if (ctx == null) {
-            LOGGER.warning("[GlassPaper] GpuNoiseKernel: no GPU context, skipping.");
+            LOGGER.warning("GpuNoiseKernel: no GPU context, skipping.");
             return null;
         }
 
         String source;
         try (InputStream is = GpuNoiseKernel.class.getResourceAsStream("/gpu/density.cl")) {
-            if (is == null) { LOGGER.severe("[GlassPaper] density.cl not found!"); return null; }
+            if (is == null) { LOGGER.severe("density.cl not found!"); return null; }
             source = new String(is.readAllBytes(), StandardCharsets.UTF_8);
         } catch (Exception e) {
-            LOGGER.severe("[GlassPaper] Failed to read density.cl: " + e.getMessage());
+            LOGGER.severe("Failed to read density.cl: " + e.getMessage());
             return null;
         }
 
@@ -51,12 +51,12 @@ public final class GpuNoiseKernel {
             byte[] logBytes = new byte[(int) logSize[0]];
             clGetProgramBuildInfo(program, ctx.device(), CL_PROGRAM_BUILD_LOG,
                 logBytes.length, Pointer.to(logBytes), null);
-            LOGGER.info("[GlassPaper] Kernel build log:\n" +
+            LOGGER.info("Kernel build log:\n" +
                 new String(logBytes, StandardCharsets.UTF_8).trim());
         }
 
         if (buildResult != CL_SUCCESS) {
-            LOGGER.severe("[GlassPaper] density.cl compilation FAILED (code " + buildResult + ")");
+            LOGGER.severe("density.cl compilation FAILED (code " + buildResult + ")");
             clReleaseProgram(program);
             return null;
         }
@@ -68,7 +68,7 @@ public final class GpuNoiseKernel {
             result.densityTreePool.add(clCreateKernel(program, "evalDensityTree", null));
         }
 
-        LOGGER.info("[GlassPaper] density.cl compiled and kernel ready.");
+        LOGGER.info("density.cl compiled and kernel ready.");
         return result;
     }
 

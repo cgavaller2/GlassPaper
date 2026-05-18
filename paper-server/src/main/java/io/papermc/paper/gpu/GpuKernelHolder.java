@@ -39,10 +39,10 @@ public final class GpuKernelHolder {
 
         if (fn.getClass().getSimpleName().equals("BlendDensity") && !blendDensityLogged) {
             blendDensityLogged = true;
-            StringBuilder sb = new StringBuilder("[GlassPaper] BlendDensity iOps: ");
+            StringBuilder sb = new StringBuilder("BlendDensity iOps: ");
             for (int op : cdf.iOps) sb.append(op).append(",");
             java.util.logging.Logger.getLogger("GlassPaper").info(sb.toString());
-            sb = new StringBuilder("[GlassPaper] BlendDensity dArgs count: " + cdf.dArgs.length
+            sb = new StringBuilder("BlendDensity dArgs count: " + cdf.dArgs.length
                 + " octaves: " + (cdf.octaveParams.length/4));
             java.util.logging.Logger.getLogger("GlassPaper").info(sb.toString());
         }

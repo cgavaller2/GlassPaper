@@ -26,7 +26,7 @@ public final class GpuContext {
         int[] numPlatforms = new int[1];
         clGetPlatformIDs(0, null, numPlatforms);
         if (numPlatforms[0] == 0) {
-            LOGGER.warning("[GlassPaper] No OpenCL platforms found. GPU acceleration disabled.");
+            LOGGER.warning("No OpenCL platforms found. GPU acceleration disabled.");
             return null;
         }
 
@@ -53,12 +53,12 @@ public final class GpuContext {
         }
 
         if (chosenDevice == null) {
-            LOGGER.warning("[GlassPaper] No usable OpenCL device found. GPU acceleration disabled.");
+            LOGGER.warning("No usable OpenCL device found. GPU acceleration disabled.");
             return null;
         }
 
-        LOGGER.info("[GlassPaper] OpenCL device selected: " + queryString(chosenDevice, CL_DEVICE_NAME));
-        LOGGER.info("[GlassPaper] OpenCL version: "         + queryString(chosenDevice, CL_DEVICE_VERSION));
+        LOGGER.info("OpenCL device selected: " + queryString(chosenDevice, CL_DEVICE_NAME));
+        LOGGER.info("OpenCL version: "         + queryString(chosenDevice, CL_DEVICE_VERSION));
 
         cl_context_properties props = new cl_context_properties();
         props.addProperty(CL_CONTEXT_PLATFORM, chosenPlatform);
@@ -78,7 +78,7 @@ public final class GpuContext {
         clReleaseCommandQueue(queue);
         clReleaseContext(context);
         INSTANCE = null;
-        LOGGER.info("[GlassPaper] GPU context released.");
+        LOGGER.info("GPU context released.");
     }
 
     private static String queryString(cl_device_id device, int param) {
