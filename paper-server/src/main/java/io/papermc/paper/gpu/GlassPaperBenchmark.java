@@ -25,7 +25,26 @@ public final class GlassPaperBenchmark {
     private static long             largestBatch      = 0;
     private static final Object     batchLock         = new Object();
 
+    private static final AtomicLong blendedFallbacks = new AtomicLong();
+
+    public static void recordBlendedFallback() { blendedFallbacks.incrementAndGet(); }
+
     private GlassPaperBenchmark() {}
+
+    private static volatile boolean validating = false;
+    private static final java.util.concurrent.ConcurrentHashMap<String, AtomicLong>
+        mismatches = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile double maxMismatch = 0;
+
+    public static boolean isValidating() { return validating; }
+    public static void setValidating(boolean v) { validating = v; }
+
+    public static void recordMismatch(String type, double delta, int x, int y, int z) {
+        mismatches.computeIfAbsent(type, k -> new AtomicLong()).incrementAndGet();
+        synchronized (GlassPaperBenchmark.class) {
+            if (delta > maxMismatch) maxMismatch = delta;
+        }
+    }
 
     public static void recordGpu(long nanos, int points) {
         gpuCalls.incrementAndGet();
@@ -64,6 +83,14 @@ public final class GlassPaperBenchmark {
             }
         }
 
+        LOGGER.info(String.format("[GlassPaper] Blended fallbacks: %,d", blendedFallbacks.get()));
+
+        if (!compileFailures.isEmpty()) {
+            LOGGER.info("[GlassPaper] Compile failures by reason:");
+            compileFailures.forEach((reason, count) ->
+                LOGGER.info(String.format("[GlassPaper]   %s : %,d", reason, count.get())));
+        }
+
         if (gCalls > 0) {
             double avgGpuMs   = (gNanos / (double) gCalls) / 1_000_000.0;
             double totalGpuMs = gNanos / 1_000_000.0;
@@ -94,6 +121,13 @@ public final class GlassPaperBenchmark {
             functionTypes.forEach((type, count) ->
                 LOGGER.info(String.format("[GlassPaper]   %s : %,d", type, count.get())));
         }
+
+        if (!mismatches.isEmpty()) {
+            LOGGER.info(String.format("[GlassPaper] Max GPU/CPU delta  : %.6f", maxMismatch));
+            LOGGER.info("[GlassPaper] Mismatches by type:");
+            mismatches.forEach((type, count) ->
+                LOGGER.info(String.format("[GlassPaper]   %s : %,d", type, count.get())));
+        }
     }
 
     public static void reset() {
@@ -121,6 +155,13 @@ public final class GlassPaperBenchmark {
         synchronized (batchLock) {
             if (points > largestBatch) largestBatch = points;
         }
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, AtomicLong>
+        compileFailures = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static void recordCompileFailure(String reason) {
+        compileFailures.computeIfAbsent(reason, k -> new AtomicLong()).incrementAndGet();
     }
 
 }

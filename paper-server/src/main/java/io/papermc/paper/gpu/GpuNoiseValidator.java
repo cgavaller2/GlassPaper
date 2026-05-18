@@ -2,6 +2,9 @@ package io.papermc.paper.gpu;
 
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.levelgen.synth.ImprovedNoise;
+import net.minecraft.world.level.levelgen.DensityFunction;
+import net.minecraft.world.level.levelgen.DensityFunctions;
+import net.minecraft.world.level.levelgen.synth.NormalNoise;
 
 import java.lang.reflect.Field;
 import java.util.logging.Logger;
@@ -172,5 +175,91 @@ public final class GpuNoiseValidator {
             return false;
         }
     }
+
+    public static boolean validateBlendedNoise(GpuNoiseKernel kernel) {
+        LOGGER.info("[GlassPaper] Running BlendedNoise GPU validation (10000 samples)...");
+        try {
+            net.minecraft.util.RandomSource rng = net.minecraft.util.RandomSource.create(12345L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise bn =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    rng, 0.25, 0.125, 80.0, 160.0, 8.0);
+
+            net.minecraft.util.RandomSource dr = net.minecraft.util.RandomSource.create(99999L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise dummy1 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr, 1.0, 1.0, 80.0, 160.0, 8.0);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise dummy2 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr, 1.0, 1.0, 80.0, 160.0, 8.0);
+
+            io.papermc.paper.gpu.CompiledDensityFunction cdf =
+                net.minecraft.world.level.levelgen.DensityFunctionCompiler
+                    .compileBlendedNoiseTestTree(bn, dummy1, dummy2);
+
+            if (cdf == null) {
+                LOGGER.severe("[GlassPaper] BlendedNoise validation: compile failed");
+                return false;
+            }
+
+            io.papermc.paper.gpu.GpuCompiledKernel gpuKernel =
+                io.papermc.paper.gpu.GpuCompiledKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), cdf);
+
+            int count = 10000;
+            double[] positions  = new double[count * 3];
+            double[] cpuResults = new double[count];
+            net.minecraft.util.RandomSource posRng =
+                net.minecraft.util.RandomSource.create(55555L);
+
+            for (int i = 0; i < count; i++) {
+                int bx = (int)((posRng.nextDouble() - 0.5) * 60000);  // ±30000 blocks
+                int by = (int)(posRng.nextDouble() * 384) - 64;         // -64 to 320
+                int bz = (int)((posRng.nextDouble() - 0.5) * 60000);
+                positions[i * 3]     = bx;
+                positions[i * 3 + 1] = by;
+                positions[i * 3 + 2] = bz;
+                net.minecraft.world.level.levelgen.DensityFunction.FunctionContext ctx =
+                    new net.minecraft.world.level.levelgen.DensityFunction.SinglePointContext(bx, by, bz);
+                // CPU: dummy1 + dummy2 + bn
+                cpuResults[i] = dummy1.compute(ctx) + dummy2.compute(ctx) + bn.compute(ctx);
+            }
+
+            double[] gpuResults = kernel.evalDensityTreeFast(positions, gpuKernel, count);
+            gpuKernel.close();
+
+            int failures = 0;
+            double maxDelta = 0.0;
+            for (int i = 0; i < count; i++) {
+                double delta = Math.abs(cpuResults[i] - gpuResults[i]);
+                if (delta > maxDelta) maxDelta = delta;
+                if (delta > 1e-6) {
+                    failures++;
+                    if (failures <= 5) {
+                        LOGGER.severe(String.format(
+                            "[GlassPaper] BlendedNoise MISMATCH pos=(%.0f,%.0f,%.0f) " +
+                                "cpu=%.10f gpu=%.10f delta=%.3e",
+                            positions[i*3], positions[i*3+1], positions[i*3+2],
+                            cpuResults[i], gpuResults[i], delta));
+                    }
+                }
+            }
+
+            if (failures == 0) {
+                LOGGER.info(String.format(
+                    "[GlassPaper] BlendedNoise validation PASSED. max delta = %.2e", maxDelta));
+                return true;
+            } else {
+                LOGGER.severe(String.format(
+                    "[GlassPaper] BlendedNoise validation FAILED. %d/100 mismatched, " +
+                        "max delta = %.2e", failures, maxDelta));
+                return false;
+            }
+        } catch (Exception e) {
+            LOGGER.severe("[GlassPaper] BlendedNoise validation exception: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
 
 }

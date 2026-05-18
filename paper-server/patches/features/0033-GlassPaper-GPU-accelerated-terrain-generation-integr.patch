@@ -1,0 +1,1083 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Mon, 18 May 2026 11:50:02 -0500
+Subject: [PATCH] GlassPaper: GPU-accelerated terrain generation integration
+
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index ca2caace6aab0dfcb0ab7a0fd28e66555c62fdc5..90318bdbe021c93f86370ad0bda25b0fba6b0120 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1014,6 +1014,19 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+ 
+         LOGGER.info("Stopping server");
+         Commands.COMMAND_SENDING_POOL.shutdownNow(); // Paper - Perf: Async command map building; Shutdown and don't bother finishing
++
++        // GlassPaper: print benchmark report on shutdown
++        io.papermc.paper.gpu.GlassPaperBenchmark.report();
++        if (io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue() != null) {
++            io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue().shutdown();
++        }
++        // GlassPaper: release cached GPU kernel buffers
++        io.papermc.paper.gpu.GpuKernelHolder.releaseAll();
++        // GlassPaper: Release GPU resources
++        if (io.papermc.paper.gpu.GpuContext.get() != null) {
++            io.papermc.paper.gpu.GpuContext.get().shutdown();
++        }
++
+         // CraftBukkit start
+         if (this.server != null) {
+             this.server.spark.disable(); // Paper - spark
+@@ -1260,6 +1273,36 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             this.status = this.buildServerStatus();
+ 
+             this.server.spark.enableBeforePlugins(); // Paper - spark
++
++            // GlassPaper: Initialize GPU context and compile noise kernel
++            io.papermc.paper.gpu.GpuContext gpuCtx = io.papermc.paper.gpu.GpuContext.init();
++            if (gpuCtx != null) {
++                LOGGER.info("GlassPaper GPU acceleration is active.");
++                io.papermc.paper.gpu.GpuNoiseKernel kernel = io.papermc.paper.gpu.GpuNoiseKernel.build();
++                if (kernel != null) {
++                    boolean valid = io.papermc.paper.gpu.GpuNoiseValidator.validate(kernel);
++                    if (valid) {
++                        boolean normalNoiseValid = io.papermc.paper.gpu.GpuNoiseValidator.validateNormalNoise(kernel);
++                        if (normalNoiseValid) {
++                            io.papermc.paper.gpu.GpuKernelHolder.set(kernel);
++                            // GlassPaper: start GPU dispatch queue
++                            // Defaults: flush at 4096 points OR every 2ms — tune with gpuconfig command
++                            io.papermc.paper.gpu.GpuDispatchQueue dispatchQueue = new io.papermc.paper.gpu.GpuDispatchQueue(kernel, 256, 1L);
++                            io.papermc.paper.gpu.GpuKernelHolder.setDispatchQueue(dispatchQueue);
++                            LOGGER.info("GlassPaper kernel stored — GPU chunk acceleration enabled.");
++                        } else {
++                            LOGGER.warn("GlassPaper NormalNoise validation FAILED — GPU path disabled for safety.");
++                            kernel.release();
++                        }
++                    } else {
++                        LOGGER.warn("GlassPaper GPU noise validation FAILED — GPU path disabled for safety.");
++                        kernel.release();
++                    }
++                }
++            } else {
++                LOGGER.warn("GlassPaper GPU acceleration is unavailable, using CPU fallback.");
++            }
++
+             // Spigot start
+             // Paper start
+             LOGGER.info("Running delayed init tasks");
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index eb06d8f012684845146429832e977e6c1ddcd62b..7547f545a934aacb78b75c68412f4b6a72c7ec1c 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -576,6 +576,37 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             t.start();
+             return;
+         }
++
++        // GlassPaper benchmark commands
++        if (msg.equalsIgnoreCase("gpubench")) {
++            io.papermc.paper.gpu.GlassPaperBenchmark.report();
++            return;
++        }
++        if (msg.equalsIgnoreCase("gpureset")) {
++            io.papermc.paper.gpu.GlassPaperBenchmark.reset();
++            return;
++        }
++
++        if (msg.startsWith("gpuconfig ")) {
++            String[] parts = msg.split(" ");
++            if (parts.length == 3) {
++                try {
++                    int threshold = Integer.parseInt(parts[1]);
++                    long interval = Long.parseLong(parts[2]);
++                    io.papermc.paper.gpu.GpuDispatchQueue q =
++                        io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue();
++                    if (q != null) q.configure(threshold, interval);
++                    else LOGGER.info("GPU dispatch queue not active.");
++                } catch (NumberFormatException e) {
++                    LOGGER.info("Usage: gpuconfig <threshold_points> <interval_ms>");
++                    LOGGER.info("Example: gpuconfig 4096 2");
++                }
++            } else {
++                LOGGER.info("Usage: gpuconfig <threshold_points> <interval_ms>");
++            }
++            return;
++        }
++
+         // Paper end - rewrite chunk system
+         this.serverCommandQueue.add(new ConsoleInput(msg, source)); // Paper - Perf: use proper queue
+     }
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2959f89cffa860400ccd607be8f27cc1bfa0f2eb
+--- /dev/null
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -0,0 +1,809 @@
++package net.minecraft.world.level.levelgen;
++
++import io.papermc.paper.gpu.CompiledDensityFunction;
++import io.papermc.paper.gpu.DfOpcode;
++import it.unimi.dsi.fastutil.doubles.DoubleList;
++import net.minecraft.util.CubicSpline;
++import net.minecraft.world.level.levelgen.synth.ImprovedNoise;
++import net.minecraft.world.level.levelgen.synth.NormalNoise;
++import net.minecraft.world.level.levelgen.synth.PerlinNoise;
++
++import java.lang.reflect.Field;
++import java.util.*;
++import java.util.logging.Logger;
++
++/**
++ * Compiles a DensityFunction tree into a CompiledDensityFunction
++ * that can be evaluated by the GPU stack machine in density.cl.
++ *
++ * Returns null if any unsupported node type is encountered.
++ */
++public final class DensityFunctionCompiler {
++
++    private static final Logger LOGGER = Logger.getLogger("GlassPaper");
++
++    // ── Builder state ─────────────────────────────────────────────────────────
++    private final List<Integer> iOps     = new ArrayList<>();
++    private final List<Double>  dArgs    = new ArrayList<>();
++
++    // Noise registry — maps NormalNoise instance → index
++    private final IdentityHashMap<NormalNoise, Integer> noiseIndex = new IdentityHashMap<>();
++    private final List<double[]> noiseParamsEntries  = new ArrayList<>(); // 5 doubles each
++    private final List<int[]>    noiseInfoEntries    = new ArrayList<>(); // 4 ints each
++    private final List<double[]> octaveParamsEntries = new ArrayList<>(); // per octave 4 doubles
++    private final List<byte[]>   permTableEntries    = new ArrayList<>(); // per octave 256 bytes
++
++    // BlendedNoise registry
++    private final List<double[]> blendedScalarsEntries       = new ArrayList<>();
++    private final List<double[]> blendedPerlinFactorsEntries = new ArrayList<>();
++    private final List<int[]>    blendedPerlinInfoEntries    = new ArrayList<>();
++    private final IdentityHashMap<Object, Integer> blendedIndex = new IdentityHashMap<>();
++
++    // Spline registry
++    private final List<Integer> splineHeaders   = new ArrayList<>(); // 4 ints per spline
++    private final List<Float>   splineFloatPool = new ArrayList<>();
++    private final List<Integer> splineChildren  = new ArrayList<>();
++
++    // Failure flag
++    private boolean failed = false;
++    private String  failReason = "";
++
++    // ── Reflection fields ─────────────────────────────────────────────────────
++    private static Field perlinNoise_noiseLevels;
++    private static Field perlinNoise_amplitudes;
++    private static Field perlinNoise_lowestFreqInputFactor;
++    private static Field perlinNoise_lowestFreqValueFactor;
++    private static Field normalNoise_first;
++    private static Field normalNoise_second;
++    private static Field normalNoise_valueFactor;
++    private static Field improvedNoise_p;
++    private static Field improvedNoise_xo;
++    private static Field improvedNoise_yo;
++    private static Field improvedNoise_zo;
++    private static Field noiseHolder_noise;
++    private static Field splineDf_spline;
++    private static Field blendedNoise_minLimitNoise;
++    private static Field blendedNoise_maxLimitNoise;
++    private static Field blendedNoise_mainNoise;
++    private static Field blendedNoise_xzMultiplier;
++    private static Field blendedNoise_yMultiplier;
++    private static Field blendedNoise_xzFactor;
++    private static Field blendedNoise_yFactor;
++    private static Field blendedNoise_smearScaleMultiplier;
++
++    static {
++        try {
++            perlinNoise_noiseLevels           = field(PerlinNoise.class, "noiseLevels");
++            perlinNoise_amplitudes            = field(PerlinNoise.class, "amplitudes");
++            perlinNoise_lowestFreqInputFactor = field(PerlinNoise.class, "lowestFreqInputFactor");
++            perlinNoise_lowestFreqValueFactor = field(PerlinNoise.class, "lowestFreqValueFactor");
++            normalNoise_first                 = field(NormalNoise.class, "first");
++            normalNoise_second                = field(NormalNoise.class, "second");
++            normalNoise_valueFactor           = field(NormalNoise.class, "valueFactor");
++            improvedNoise_p                   = field(ImprovedNoise.class, "p");
++            improvedNoise_xo                  = field(ImprovedNoise.class, "xo");
++            improvedNoise_yo                  = field(ImprovedNoise.class, "yo");
++            improvedNoise_zo                  = field(ImprovedNoise.class, "zo");
++            noiseHolder_noise                 = field(DensityFunction.NoiseHolder.class, "noise");
++            splineDf_spline                   = field(DensityFunctions.Spline.class, "spline");
++            blendedNoise_minLimitNoise       = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "minLimitNoise");
++            blendedNoise_maxLimitNoise       = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "maxLimitNoise");
++            blendedNoise_mainNoise           = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "mainNoise");
++            blendedNoise_xzMultiplier        = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "xzMultiplier");
++            blendedNoise_yMultiplier         = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "yMultiplier");
++            blendedNoise_xzFactor            = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "xzFactor");
++            blendedNoise_yFactor             = field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "yFactor");
++            blendedNoise_smearScaleMultiplier= field(net.minecraft.world.level.levelgen.synth.BlendedNoise.class, "smearScaleMultiplier");
++        } catch (Exception e) {
++            throw new RuntimeException("[GlassPaper] DensityFunctionCompiler reflection init failed", e);
++        }
++    }
++
++    private static Field field(Class<?> cls, String name) throws NoSuchFieldException {
++        Field f = cls.getDeclaredField(name);
++        f.setAccessible(true);
++        return f;
++    }
++
++    // ── Public API ────────────────────────────────────────────────────────────
++
++    /**
++     * Attempt to compile the given density function.
++     * Returns null if any node is unsupported.
++     */
++    public static CompiledDensityFunction compile(DensityFunction fn) {
++        DensityFunctionCompiler c = new DensityFunctionCompiler();
++        c.emit(fn);
++        if (c.failed) {
++            LOGGER.warning("[GlassPaper] DensityFunctionCompiler failed: " + c.failReason);
++            return null;
++        }
++        c.iOps.add(DfOpcode.HALT);
++        return c.build();
++    }
++
++    // ── Emission ──────────────────────────────────────────────────────────────
++
++    private void emit(DensityFunction fn) {
++        if (failed) return;
++
++        // ── Unwrap NoiseChunk cache types (safe at cell corners) ──────────────
++        if (fn instanceof NoiseChunk.NoiseInterpolator ni) { emit(ni.wrapped()); return; }
++        if (fn instanceof DensityFunctions.MarkerOrMarked m) { emit(m.wrapped()); return; }
++
++        // ShiftA: noise.getValue(x * 0.25, 0.0, z * 0.25) * 4.0
++        if (fn instanceof DensityFunctions.ShiftA sa) {
++            NormalNoise nn = extractNoise(sa.offsetNoise());
++            if (nn == null) { fail("ShiftA: NormalNoise not initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            // Push constant 0.0 for Y shift, then use SHIFTED_NOISE with xzScale=0.25, yScale=0.0
++            // But ShiftA always uses y=0, so we emit a scaled noise with fixed y=0
++            // We handle this via a new approach: push 0.0 for shiftX, shiftY, shiftZ
++            // then multiply result by 4.0
++            // Actually ShiftA.compute = offsetNoise.getValue(x*0.25, 0.0, z*0.25) * 4.0
++            // Map to NOISE opcode with xzScale=0.25, yScale=0.0, then MUL_CONST 4.0
++            // BUT y coord must be forced to 0 — we need PUSH_CONST 0.0 for Y
++            // Use SHIFTED_NOISE with shifts (0, -y, 0) to zero out Y:
++            // shifted = getValue(x*xzS + 0, y*yS + (-y), z*xzS + 0)
++            // With xzS=0.25, yS=0.0: getValue(x*0.25, 0, z*0.25) ✓
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftX = 0
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftY = 0 (yScale=0 zeros Y anyway)
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftZ = 0
++            iOps.add(DfOpcode.SHIFTED_NOISE);
++            iOps.add(idx);
++            dArgs.add(0.25);  // xzScale
++            dArgs.add(0.0);   // yScale — zeroes out Y entirely
++            iOps.add(DfOpcode.MUL_CONST);
++            dArgs.add(4.0);
++            return;
++        }
++
++        // ShiftB: noise.getValue(blockZ * 0.25, blockX * 0.25, 0.0) * 4.0
++        // compute(ctx) = offsetNoise.getValue(z*0.25, x*0.25, 0.0) * 4.0
++        // This swaps X and Z and zeroes the third axis — needs a dedicated opcode
++        if (fn instanceof DensityFunctions.ShiftB sb) {
++            NormalNoise nn = extractNoise(sb.offsetNoise());
++            if (nn == null) { fail("ShiftB: NormalNoise not initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftX
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftY
++            iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); // shiftZ
++            iOps.add(DfOpcode.SHIFT_B_NOISE);
++            iOps.add(idx);
++            dArgs.add(0.25);
++            iOps.add(DfOpcode.MUL_CONST);
++            dArgs.add(4.0);
++            return;
++        }
++
++        // Shift: noise.getValue(x*0.25, y*0.25, z*0.25) * 4.0
++        if (fn instanceof DensityFunctions.Shift sh) {
++            NormalNoise nn = extractNoise(sh.offsetNoise());
++            if (nn == null) { fail("Shift: NormalNoise not initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            iOps.add(DfOpcode.NOISE);
++            iOps.add(idx);
++            dArgs.add(0.25);  // xzScale
++            dArgs.add(0.25);  // yScale
++            iOps.add(DfOpcode.MUL_CONST);
++            dArgs.add(4.0);
++            return;
++        }
++
++        // DensityFunctions.BlendAlpha — singleton, always 1.0 for empty blender
++        if (fn == DensityFunctions.BlendAlpha.INSTANCE) {
++            iOps.add(DfOpcode.PUSH_CONST);
++            dArgs.add(1.0);
++            return;
++        }
++
++        // DensityFunctions.BlendOffset — singleton, always 0.0 for empty blender
++        if (fn == DensityFunctions.BlendOffset.INSTANCE) {
++            iOps.add(DfOpcode.PUSH_CONST);
++            dArgs.add(0.0);
++            return;
++        }
++
++        // NoiseChunk inner BlendAlpha/BlendOffset wrappers
++        if (fn instanceof NoiseChunk.NoiseChunkDensityFunction ncdf) {
++            DensityFunction inner = ncdf.wrapped();
++            if (inner == DensityFunctions.BlendAlpha.INSTANCE) {
++                iOps.add(DfOpcode.PUSH_CONST); dArgs.add(1.0); return;
++            }
++            if (inner == DensityFunctions.BlendOffset.INSTANCE) {
++                iOps.add(DfOpcode.PUSH_CONST); dArgs.add(0.0); return;
++            }
++            // Other NoiseChunkDensityFunction types — try compiling the wrapped function
++            emit(inner);
++            return;
++        }
++
++        // Use getClass().getSimpleName() for private inner classes
++        String cls = fn.getClass().getSimpleName();
++        if (cls.equals("Cache2D") || cls.equals("CacheOnce") ||
++            cls.equals("FlatCache") || cls.equals("CacheAllInCell")) {
++            try {
++                Field wf = fn.getClass().getDeclaredField("function");
++                if (!wf.canAccess(fn)) wf.setAccessible(true);
++                emit((DensityFunction) wf.get(fn));
++                return;
++            } catch (Exception e) {
++                // try noiseFiller field name used by some variants
++                try {
++                    Field nf = fn.getClass().getDeclaredField("noiseFiller");
++                    nf.setAccessible(true);
++                    emit((DensityFunction) nf.get(fn));
++                    return;
++                } catch (Exception e2) {
++                    fail("Cannot unwrap cache type: " + cls);
++                    return;
++                }
++            }
++        }
++
++        // ── Constant ──────────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.Constant c) {
++            iOps.add(DfOpcode.PUSH_CONST);
++            dArgs.add(c.value());
++            return;
++        }
++
++        // ── Noise ─────────────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.Noise n) {
++            NormalNoise nn = extractNoise(n.noise());
++            if (nn == null) { fail("NormalNoise not yet initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            iOps.add(DfOpcode.NOISE);
++            iOps.add(idx);
++            dArgs.add(n.xzScale());
++            dArgs.add(n.yScale());
++            return;
++        }
++
++        // ── ShiftedNoise ──────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.ShiftedNoise sn) {
++            NormalNoise nn = extractNoise(sn.noise());
++            if (nn == null) { fail("ShiftedNoise: NormalNoise not initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            // Push shifts first (they evaluate at x,y,z and push a double each)
++            emit(sn.shiftX());
++            emit(sn.shiftY());
++            emit(sn.shiftZ());
++            iOps.add(DfOpcode.SHIFTED_NOISE);
++            iOps.add(idx);
++            dArgs.add(sn.xzScale());
++            dArgs.add(sn.yScale());
++            return;
++        }
++
++        // ── YClampedGradient ──────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.YClampedGradient g) {
++            iOps.add(DfOpcode.Y_GRADIENT);
++            iOps.add(g.fromY());
++            iOps.add(g.toY());
++            dArgs.add(g.fromValue());
++            dArgs.add(g.toValue());
++            return;
++        }
++
++        // ── BlendDensity (no-op for empty blender) ────────────────────────────
++        if (fn instanceof DensityFunctions.BlendDensity bd) {
++            emit(bd.input());
++            iOps.add(DfOpcode.BLEND_DENSITY_NOOP);
++            return;
++        }
++
++        // ── RangeChoice ───────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.RangeChoice rc) {
++            emit(rc.input());
++            emit(rc.whenInRange());
++            emit(rc.whenOutOfRange());
++            iOps.add(DfOpcode.RANGE_SELECT);
++            dArgs.add(rc.minInclusive());
++            dArgs.add(rc.maxExclusive());
++            return;
++        }
++
++        // ── Two-argument functions (Add, Mul, Min, Max) ───────────────────────
++        if (fn instanceof DensityFunctions.TwoArgumentSimpleFunction tf) {
++            emit(tf.argument1());
++            emit(tf.argument2());
++            iOps.add(switch (tf.type()) {
++                case ADD -> DfOpcode.ADD;
++                case MUL -> DfOpcode.MUL;
++                case MIN -> DfOpcode.MIN_OP;
++                case MAX -> DfOpcode.MAX_OP;
++            });
++            return;
++        }
++
++        // ── MulOrAdd (constant-optimized form) ────────────────────────────────
++        if (cls.equals("MulOrAdd")) {
++            try {
++                Field inputF = fn.getClass().getDeclaredField("input");
++                Field argF   = fn.getClass().getDeclaredField("argument");
++                Field typeF  = fn.getClass().getDeclaredField("specificType");
++                inputF.setAccessible(true); argF.setAccessible(true); typeF.setAccessible(true);
++                DensityFunction input = (DensityFunction) inputF.get(fn);
++                double arg            = (double) argF.get(fn);
++                Object type           = typeF.get(fn);
++                emit(input);
++                if (type.toString().equals("MUL")) {
++                    iOps.add(DfOpcode.MUL_CONST); dArgs.add(arg);
++                } else {
++                    iOps.add(DfOpcode.ADD_CONST); dArgs.add(arg);
++                }
++                return;
++            } catch (Exception e) {
++                fail("MulOrAdd reflection failed: " + e.getMessage()); return;
++            }
++        }
++
++        // ── Clamp ─────────────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.Clamp cl) {
++            emit(cl.input());
++            iOps.add(DfOpcode.CLAMP);
++            dArgs.add(cl.minValue());
++            dArgs.add(cl.maxValue());
++            return;
++        }
++
++        // ── Mapped (Abs, Square, Cube, etc.) ──────────────────────────────────
++        if (cls.equals("Mapped")) {
++            try {
++                Field inputF = fn.getClass().getDeclaredField("input");
++                Field typeF  = fn.getClass().getDeclaredField("type");
++                inputF.setAccessible(true); typeF.setAccessible(true);
++                DensityFunction input = (DensityFunction) inputF.get(fn);
++                emit(input);
++                String typeName = typeF.get(fn).toString();
++                iOps.add(switch (typeName) {
++                    case "ABS"              -> DfOpcode.ABS;
++                    case "SQUARE"           -> DfOpcode.SQUARE;
++                    case "CUBE"             -> DfOpcode.CUBE;
++                    case "HALF_NEGATIVE"    -> DfOpcode.HALF_NEGATIVE;
++                    case "QUARTER_NEGATIVE" -> DfOpcode.QUARTER_NEGATIVE;
++                    case "SQUEEZE"          -> DfOpcode.SQUEEZE;
++                    case "INVERT"           -> DfOpcode.INVERT;
++                    default -> { fail("Unknown Mapped type: " + typeName); yield -1; }
++                });
++                return;
++            } catch (Exception e) {
++                fail("Mapped reflection failed: " + e.getMessage()); return;
++            }
++        }
++
++        // ── Spline ────────────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.Spline sf) {
++            try {
++                CubicSpline<?, ?> spline = (CubicSpline<?, ?>) splineDf_spline.get(sf);
++                emitSpline(spline);
++            } catch (Exception e) {
++                fail("Spline extraction failed: " + e.getMessage());
++            }
++            return;
++        }
++
++        // ── HolderHolder ──────────────────────────────────────────────────────
++        if (fn instanceof DensityFunctions.HolderHolder hh) {
++            emit(hh.function().value());
++            return;
++        }
++
++        // BlendedNoise
++        if (fn instanceof net.minecraft.world.level.levelgen.synth.BlendedNoise bn) {
++            fail("BlendedNoise: temporarily disabled for debugging");
++            return;
++        }
++
++        // WeirdScaledSampler re-enabled:
++        if (fn instanceof DensityFunctions.WeirdScaledSampler ws) {
++            NormalNoise nn = extractNoise(ws.noise());
++            if (nn == null) { fail("WeirdScaledSampler: NormalNoise not initialized"); return; }
++            int idx = registerNoise(nn);
++            if (failed) return;
++            int mapperType = ws.rarityValueMapper().name().equals("TYPE1") ? 0 : 1;
++            emit(ws.input());
++            iOps.add(DfOpcode.WEIRD_SCALED_SAMPLER);
++            iOps.add(idx);
++            iOps.add(mapperType);
++            return;
++        }
++
++        // ── BeardifierMarker (zero contribution in noise sampling) ────────────
++        if (fn instanceof DensityFunctions.BeardifierOrMarker) {
++            iOps.add(DfOpcode.PUSH_CONST);
++            dArgs.add(0.0);
++            return;
++        }
++
++        // ── Unsupported ───────────────────────────────────────────────────────
++        fail("Unsupported DensityFunction type: " + fn.getClass().getName());
++    }
++
++    // ── Spline compilation ────────────────────────────────────────────────────
++
++    private void emitSpline(CubicSpline<?, ?> rootSpline) {
++        // 1. Collect all unique coordinate density functions, by depth level
++        //    (innermost = highest depth number → pushed first = deepest on stack)
++        List<DensityFunction> coordsByLevel = new ArrayList<>();
++        collectSplineCoords(rootSpline, 0, coordsByLevel);
++        int depth = coordsByLevel.size();
++
++        // 2. Emit coordinate evaluations: innermost first (pushed deepest)
++        for (int d = depth - 1; d >= 0; d--) {
++            emit(coordsByLevel.get(d));
++            if (failed) return;
++        }
++
++        // 3. Compile the spline tree into the spline data buffers
++        int splineIdx = compileSpline(rootSpline, 0);
++        if (failed) return;
++
++        // 4. Emit the SPLINE_EVAL opcode
++        iOps.add(DfOpcode.SPLINE_EVAL);
++        iOps.add(splineIdx);
++        iOps.add(depth);
++    }
++
++    /**
++     * Walk the spline tree depth-first and collect unique coordinate
++     * DensityFunctions per depth level (deduped by identity).
++     */
++    private void collectSplineCoords(CubicSpline<?, ?> spline, int depth,
++                                     List<DensityFunction> result) {
++        if (isConstantSpline(spline)) return;
++        DensityFunction coord = getSplineCoord(spline);
++        if (coord != null) {
++            // Ensure result list is large enough
++            while (result.size() <= depth) result.add(null);
++            if (result.get(depth) == null) {
++                result.set(depth, coord);
++            }
++        }
++        List<CubicSpline<?, ?>> children = getSplineValues(spline);
++        for (CubicSpline<?, ?> child : children) {
++            collectSplineCoords(child, depth + 1, result);
++        }
++    }
++
++    private int compileSpline(CubicSpline<?, ?> spline, int depth) {
++        if (failed) return -1;
++        int idx = splineHeaders.size() / 4;
++
++        if (isConstantSpline(spline)) {
++            float val = getConstantSplineValue(spline);
++            int fpStart = splineFloatPool.size();
++            splineFloatPool.add(val);
++            splineHeaders.add(0); // type = constant
++            splineHeaders.add(0); // knotCount
++            splineHeaders.add(fpStart);
++            splineHeaders.add(0);
++            return idx;
++        }
++
++        float[] locs   = getSplineLocations(spline);
++        float[] derivs = getSplineDerivatives(spline);
++        List<CubicSpline<?, ?>> values = getSplineValues(spline);
++
++        if (locs == null || derivs == null || values == null) {
++            fail("Could not extract spline data"); return -1;
++        }
++        int knotCount = locs.length;
++
++        int fpStart = splineFloatPool.size();
++        for (float l : locs)   splineFloatPool.add(l);
++        for (float d : derivs) splineFloatPool.add(d);
++
++        // Check if all values are constants
++        boolean allConstants = values.stream().allMatch(this::isConstantSpline);
++
++        if (allConstants) {
++            // type 1: float values
++            int valStart = splineFloatPool.size();
++            for (CubicSpline<?, ?> v : values) splineFloatPool.add(getConstantSplineValue(v));
++            splineHeaders.add(1); // type
++            splineHeaders.add(knotCount);
++            splineHeaders.add(fpStart);
++            splineHeaders.add(valStart);
++        } else {
++            // type 2: spline children — reserve header slot first (so idx is stable)
++            splineHeaders.add(2); // type
++            splineHeaders.add(knotCount);
++            splineHeaders.add(fpStart);
++            int csStart = splineChildren.size();
++            splineHeaders.add(csStart);
++            // Add child placeholders
++            for (int i = 0; i < knotCount; i++) splineChildren.add(-1);
++            // Recursively compile children
++            for (int i = 0; i < knotCount; i++) {
++                int childIdx = compileSpline(values.get(i), depth + 1);
++                if (failed) return -1;
++                splineChildren.set(csStart + i, childIdx);
++            }
++        }
++        return idx;
++    }
++
++    // ── Spline reflection helpers ─────────────────────────────────────────────
++
++    private boolean isConstantSpline(CubicSpline<?, ?> s) {
++        return s.getClass().getSimpleName().equals("Constant");
++    }
++
++    private float getConstantSplineValue(CubicSpline<?, ?> s) {
++        try {
++            Field f = s.getClass().getDeclaredField("value");
++            f.setAccessible(true);
++            return (float) f.get(s);
++        } catch (Exception e) { fail("Constant spline value: " + e.getMessage()); return 0; }
++    }
++
++    private DensityFunction getSplineCoord(CubicSpline<?, ?> s) {
++        try {
++            Field f = s.getClass().getDeclaredField("coordinate");
++            f.setAccessible(true);
++            Object coord = f.get(s);
++            // coord is a Spline.Coordinate (record) with function() accessor
++            return (DensityFunction)
++                coord.getClass().getMethod("function").invoke(coord);
++            // function() returns Holder<DensityFunction>
++            // We need to unwrap: .value()
++        } catch (Exception e) {
++            try {
++                Field f = s.getClass().getDeclaredField("coordinate");
++                f.setAccessible(true);
++                Object coord = f.get(s);
++                // Try Holder<DensityFunction>.value()
++                Object holder = coord.getClass().getMethod("function").invoke(coord);
++                return (DensityFunction) holder.getClass().getMethod("value").invoke(holder);
++            } catch (Exception e2) {
++                fail("spline coord: " + e2.getMessage()); return null;
++            }
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<CubicSpline<?, ?>> getSplineValues(CubicSpline<?, ?> s) {
++        try {
++            Field f = s.getClass().getDeclaredField("values");
++            f.setAccessible(true);
++            return (List<CubicSpline<?, ?>>) f.get(s);
++        } catch (Exception e) { fail("spline values: " + e.getMessage()); return null; }
++    }
++
++    private float[] getSplineLocations(CubicSpline<?, ?> s) {
++        try {
++            Field f = s.getClass().getDeclaredField("locations");
++            f.setAccessible(true);
++            return (float[]) f.get(s);
++        } catch (Exception e) { fail("spline locations: " + e.getMessage()); return null; }
++    }
++
++    private float[] getSplineDerivatives(CubicSpline<?, ?> s) {
++        try {
++            Field f = s.getClass().getDeclaredField("derivatives");
++            f.setAccessible(true);
++            return (float[]) f.get(s);
++        } catch (Exception e) { fail("spline derivs: " + e.getMessage()); return null; }
++    }
++
++    // ── Noise registration ────────────────────────────────────────────────────
++
++    private NormalNoise extractNoise(DensityFunction.NoiseHolder holder) {
++        try { return (NormalNoise) noiseHolder_noise.get(holder); }
++        catch (Exception e) { return null; }
++    }
++
++    private int registerNoise(NormalNoise nn) {
++        if (noiseIndex.containsKey(nn)) return noiseIndex.get(nn);
++        int idx = noiseIndex.size();
++        noiseIndex.put(nn, idx);
++        try {
++            PerlinNoise first  = (PerlinNoise) normalNoise_first.get(nn);
++            PerlinNoise second = (PerlinNoise) normalNoise_second.get(nn);
++            double vf          = (double) normalNoise_valueFactor.get(nn);
++
++            double firstInput  = (double) perlinNoise_lowestFreqInputFactor.get(first);
++            double firstValue  = (double) perlinNoise_lowestFreqValueFactor.get(first);
++            double secondInput = (double) perlinNoise_lowestFreqInputFactor.get(second);
++            double secondValue = (double) perlinNoise_lowestFreqValueFactor.get(second);
++
++            noiseParamsEntries.add(new double[]{vf, firstInput, firstValue, secondInput, secondValue});
++
++            ImprovedNoise[] firstLevels  = (ImprovedNoise[]) perlinNoise_noiseLevels.get(first);
++            ImprovedNoise[] secondLevels = (ImprovedNoise[]) perlinNoise_noiseLevels.get(second);
++            DoubleList firstAmps  = (DoubleList) perlinNoise_amplitudes.get(first);
++            DoubleList secondAmps = (DoubleList) perlinNoise_amplitudes.get(second);
++
++            int firstOctaveOffset  = octaveParamsEntries.size();
++            packOctaves(firstLevels, firstAmps);
++            int secondOctaveOffset = octaveParamsEntries.size();
++            packOctaves(secondLevels, secondAmps);
++
++            noiseInfoEntries.add(new int[]{
++                firstOctaveOffset, secondOctaveOffset,
++                firstLevels.length, secondLevels.length
++            });
++        } catch (Exception e) {
++            fail("Noise registration failed: " + e.getMessage());
++        }
++        return idx;
++    }
++
++    private void packOctaves(ImprovedNoise[] levels, DoubleList amps) throws Exception {
++        for (int i = 0; i < levels.length; i++) {
++            ImprovedNoise oct = levels[i];
++            double amp = amps.getDouble(i);
++            if (oct == null || amp == 0.0) {
++                octaveParamsEntries.add(new double[]{0, 0, 0, 0});
++                permTableEntries.add(new byte[256]);
++            } else {
++                double xo = (double) improvedNoise_xo.get(oct);
++                double yo = (double) improvedNoise_yo.get(oct);
++                double zo = (double) improvedNoise_zo.get(oct);
++                octaveParamsEntries.add(new double[]{amp, xo, yo, zo});
++                permTableEntries.add((byte[]) improvedNoise_p.get(oct));
++            }
++        }
++    }
++
++    private int registerBlendedNoise(net.minecraft.world.level.levelgen.synth.BlendedNoise bn) {
++        if (blendedIndex.containsKey(bn)) return blendedIndex.get(bn);
++        int idx = blendedIndex.size();
++        blendedIndex.put(bn, idx);
++        try {
++            PerlinNoise minNoise  = (PerlinNoise) blendedNoise_minLimitNoise.get(bn);
++            PerlinNoise maxNoise  = (PerlinNoise) blendedNoise_maxLimitNoise.get(bn);
++            PerlinNoise mainNoise = (PerlinNoise) blendedNoise_mainNoise.get(bn);
++
++            double xzMul = (double) blendedNoise_xzMultiplier.get(bn);
++            double yMul  = (double) blendedNoise_yMultiplier.get(bn);
++            double xzFac = (double) blendedNoise_xzFactor.get(bn);
++            double yFac  = (double) blendedNoise_yFactor.get(bn);
++            double smear = (double) blendedNoise_smearScaleMultiplier.get(bn);
++
++            blendedScalarsEntries.add(new double[]{xzMul, yMul, xzFac, yFac, smear});
++
++            double minIF  = (double) perlinNoise_lowestFreqInputFactor.get(minNoise);
++            double minVF  = (double) perlinNoise_lowestFreqValueFactor.get(minNoise);
++            double maxIF  = (double) perlinNoise_lowestFreqInputFactor.get(maxNoise);
++            double maxVF  = (double) perlinNoise_lowestFreqValueFactor.get(maxNoise);
++            double mainIF = (double) perlinNoise_lowestFreqInputFactor.get(mainNoise);
++            double mainVF = (double) perlinNoise_lowestFreqValueFactor.get(mainNoise);
++            blendedPerlinFactorsEntries.add(new double[]{
++                minIF, minVF, maxIF, maxVF, mainIF, mainVF
++            });
++
++            ImprovedNoise[] minLevels  = (ImprovedNoise[]) perlinNoise_noiseLevels.get(minNoise);
++            ImprovedNoise[] maxLevels  = (ImprovedNoise[]) perlinNoise_noiseLevels.get(maxNoise);
++            ImprovedNoise[] mainLevels = (ImprovedNoise[]) perlinNoise_noiseLevels.get(mainNoise);
++            DoubleList minAmps  = (DoubleList) perlinNoise_amplitudes.get(minNoise);
++            DoubleList maxAmps  = (DoubleList) perlinNoise_amplitudes.get(maxNoise);
++            DoubleList mainAmps = (DoubleList) perlinNoise_amplitudes.get(mainNoise);
++
++            int minOff  = octaveParamsEntries.size(); packOctaves(minLevels,  minAmps);
++            int maxOff  = octaveParamsEntries.size(); packOctaves(maxLevels,  maxAmps);
++            int mainOff = octaveParamsEntries.size(); packOctaves(mainLevels, mainAmps);
++
++            blendedPerlinInfoEntries.add(new int[]{
++                minOff, maxOff, mainOff,
++                minLevels.length, maxLevels.length, mainLevels.length
++            });
++
++            LOGGER.info(String.format(
++                "[GlassPaper] BlendedNoise registered: idx=%d " +
++                    "minOff=%d minCnt=%d maxOff=%d maxCnt=%d mainOff=%d mainCnt=%d " +
++                    "xzMul=%.4f yMul=%.4f xzFac=%.4f yFac=%.4f smear=%.4f",
++                idx, minOff, minLevels.length, maxOff, maxLevels.length,
++                mainOff, mainLevels.length, xzMul, yMul, xzFac, yFac, smear));
++
++        } catch (Exception e) {
++            fail("BlendedNoise registration failed: " + e.getMessage());
++        }
++        return idx;
++    }
++
++    // ── Failure ───────────────────────────────────────────────────────────────
++
++    private void fail(String reason) {
++        if (!failed) {
++            failed = true;
++            failReason = reason;
++            io.papermc.paper.gpu.GlassPaperBenchmark.recordCompileFailure(reason);
++        }
++    }
++
++    public String getFailReason() { return failReason; }
++
++    // ── Build output ──────────────────────────────────────────────────────────
++
++    private CompiledDensityFunction build() {
++        // Flatten noise data
++        int noiseCount = noiseParamsEntries.size();
++        double[] noiseParams = new double[noiseCount * 5];
++        int[]    noiseInfo   = new int[noiseCount * 4];
++        for (int i = 0; i < noiseCount; i++) {
++            System.arraycopy(noiseParamsEntries.get(i), 0, noiseParams, i * 5, 5);
++            System.arraycopy(noiseInfoEntries.get(i),   0, noiseInfo,   i * 4, 4);
++        }
++
++        int octaveCount   = octaveParamsEntries.size();
++        double[] octaves  = new double[octaveCount * 4];
++        byte[]   perms    = new byte[octaveCount * 256];
++        for (int i = 0; i < octaveCount; i++) {
++            System.arraycopy(octaveParamsEntries.get(i), 0, octaves, i * 4, 4);
++            System.arraycopy(permTableEntries.get(i),    0, perms,   i * 256, 256);
++        }
++
++        // Flatten spline data
++        int[]   sHeaders  = splineHeaders.stream().mapToInt(Integer::intValue).toArray();
++        float[] sFPool    = new float[splineFloatPool.size()];
++        for (int i = 0; i < sFPool.length; i++) sFPool[i] = splineFloatPool.get(i);
++        int[]   sChildren = splineChildren.stream().mapToInt(Integer::intValue).toArray();
++
++        // Flatten blended noise data
++        int bn = blendedScalarsEntries.size();
++        double[] bScalars = new double[bn * 5];
++        double[] bFactors = new double[bn * 6];
++        int[]    bInfo    = new int[bn * 6];
++        for (int i = 0; i < bn; i++) {
++            System.arraycopy(blendedScalarsEntries.get(i),       0, bScalars, i * 5, 5);
++            System.arraycopy(blendedPerlinFactorsEntries.get(i), 0, bFactors, i * 6, 6);
++            System.arraycopy(blendedPerlinInfoEntries.get(i),    0, bInfo,    i * 6, 6);
++        }
++
++        return new CompiledDensityFunction(
++            iOps.stream().mapToInt(Integer::intValue).toArray(),
++            dArgs.stream().mapToDouble(Double::doubleValue).toArray(),
++            noiseParams, noiseInfo, octaves, perms,
++            sHeaders, sFPool, sChildren,
++            bScalars, bFactors, bInfo
++        );
++    }
++
++    /**
++     * Compiles a test tree for BlendedNoise validation that replicates
++     * the in-game octave buffer layout (BlendedNoise at offsets ~80+).
++     * Used by GpuNoiseValidator to catch offset-dependent kernel bugs.
++     *
++     * Returns the compiled function, or null on failure.
++     * The CPU reference is: dummy1 + dummy2 + bn
++     */
++    public static CompiledDensityFunction compileBlendedNoiseTestTree(
++        net.minecraft.world.level.levelgen.synth.BlendedNoise bn,
++        net.minecraft.world.level.levelgen.synth.BlendedNoise dummy1,
++        net.minecraft.world.level.levelgen.synth.BlendedNoise dummy2) {
++        DensityFunctionCompiler c = new DensityFunctionCompiler();
++
++        // Register dummy1 directly — bypasses emit() disabled check
++        int idx1 = c.registerBlendedNoise(dummy1);
++        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (dummy1): " + c.failReason); return null; }
++        c.iOps.add(DfOpcode.BLENDED_NOISE);
++        c.iOps.add(idx1);
++
++        // Register dummy2
++        int idx2 = c.registerBlendedNoise(dummy2);
++        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (dummy2): " + c.failReason); return null; }
++        c.iOps.add(DfOpcode.BLENDED_NOISE);
++        c.iOps.add(idx2);
++
++        c.iOps.add(DfOpcode.ADD); // dummy1 + dummy2
++
++        // Register real bn
++        int idx3 = c.registerBlendedNoise(bn);
++        if (c.failed) { LOGGER.warning("[GlassPaper] BlendedNoise test tree failed (bn): " + c.failReason); return null; }
++        c.iOps.add(DfOpcode.BLENDED_NOISE);
++        c.iOps.add(idx3);
++
++        c.iOps.add(DfOpcode.ADD); // (dummy1+dummy2) + bn
++        c.iOps.add(DfOpcode.HALT);
++        return c.build();
++    }
++
++}
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index b7f4943b6c862f4b99aa7920af3fc91fc9fd0b76..0c0dffc73d9b012527536b5603b345ab4177a3d0 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -230,6 +230,17 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+         this.cellStartBlockX = start * this.cellWidth;
+         this.inCellX = 0;
+ 
++        // GlassPaper: pre-collect all (blockX, blockY, blockZ) positions for this slice
++        // so they can be dispatched to GPU in one batch per interpolator.
++        // cellCountXZ+1 Z columns × cellCountY+1 Y levels = all cell-corner positions.
++        if (io.papermc.paper.gpu.GpuKernelHolder.isAvailable() && this.blender == Blender.empty()) {
++            this.fillSliceGpu(isSlice0, start);
++            return;
++        }
++
++        io.papermc.paper.gpu.GlassPaperBenchmark.recordBlendedFallback();
++
++        // CPU fallback — original Paper logic unchanged
+         for (int i = 0; i < this.cellCountXZ + 1; i++) {
+             int i1 = this.firstCellZ + i;
+             this.cellStartBlockZ = i1 * this.cellWidth;
+@@ -245,6 +256,136 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+         this.arrayInterpolationCounter++;
+     }
+ 
++    /**
++     * GlassPaper GPU slice filling path.
++     *
++     * Pre-collects all cell-corner positions for the slice, dispatches them
++     * to the GPU kernel in one batch per interpolator, and writes results
++     * directly into the interpolator's slice arrays.
++     *
++     * Falls back to per-element CPU evaluation for density functions that
++     * cannot yet be evaluated on the GPU.
++     */
++    private void fillSliceGpu(boolean isSlice0, int start) {
++        int yLevels     = this.cellCountY + 1;
++        int zColumns    = this.cellCountXZ + 1;
++        int pointsPerInterp = zColumns * yLevels;
++
++        // Build position array — same for all interpolators
++        double[] positions = new double[pointsPerInterp * 3];
++        int posIdx = 0;
++        for (int zi = 0; zi < zColumns; zi++) {
++            int blockZ = (this.firstCellZ + zi) * this.cellWidth;
++            for (int yi = 0; yi < yLevels; yi++) {
++                int blockY = (yi + this.cellNoiseMinY) * this.cellHeight;
++                positions[posIdx++] = this.cellStartBlockX;
++                positions[posIdx++] = blockY;
++                positions[posIdx++] = blockZ;
++            }
++        }
++
++        this.arrayInterpolationCounter += zColumns;
++
++        // Resolve GPU kernels for all interpolators up front
++        io.papermc.paper.gpu.GpuNoiseKernel gpuKernel =
++            io.papermc.paper.gpu.GpuKernelHolder.get();
++
++        io.papermc.paper.gpu.GpuCompiledKernel[] compiledKernels =
++            new io.papermc.paper.gpu.GpuCompiledKernel[this.interpolators.size()];
++
++        boolean anyGpu = false;
++        for (int i = 0; i < this.interpolators.size(); i++) {
++            DensityFunction fn = this.interpolators.get(i).wrapped();
++            io.papermc.paper.gpu.GlassPaperBenchmark.recordFunctionType(
++                fn.getClass().getSimpleName());
++            if (gpuKernel != null) {
++                compiledKernels[i] = io.papermc.paper.gpu.GpuKernelHolder.getOrUpload(fn);
++                if (compiledKernels[i] != null) anyGpu = true;
++            }
++        }
++
++        if (!anyGpu) {
++            // All CPU fallback
++            for (int zi = 0; zi < zColumns; zi++) {
++                int i1 = this.firstCellZ + zi;
++                this.cellStartBlockZ = i1 * this.cellWidth;
++                this.inCellZ = 0;
++                for (NoiseChunk.NoiseInterpolator interp : this.interpolators) {
++                    double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                    long cpuStart = System.nanoTime();
++                    interp.fillArray(slice, this.sliceFillingContextProvider);
++                    io.papermc.paper.gpu.GlassPaperBenchmark.recordCpu(
++                        System.nanoTime() - cpuStart);
++                }
++            }
++            this.arrayInterpolationCounter++;
++            return;
++        }
++
++        // Dispatch each GPU-capable interpolator, CPU fallback for the rest
++        for (int i = 0; i < this.interpolators.size(); i++) {
++            NoiseChunk.NoiseInterpolator interp = this.interpolators.get(i);
++            io.papermc.paper.gpu.GpuCompiledKernel ck = compiledKernels[i];
++
++            if (ck != null && gpuKernel != null) {
++                io.papermc.paper.gpu.GpuDispatchQueue queue =
++                    io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue();
++
++                double[] results;
++                if (queue != null) {
++                    results = queue.submit(positions, ck, pointsPerInterp);
++                } else {
++                    long gpuStart = System.nanoTime();
++                    results = gpuKernel.evalDensityTreeFast(positions, ck, pointsPerInterp);
++                    io.papermc.paper.gpu.GlassPaperBenchmark.recordGpu(
++                        System.nanoTime() - gpuStart, pointsPerInterp);
++                }
++
++
++                if (results != null) {
++                    for (int zi = 0; zi < zColumns; zi++) {
++                        double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                        System.arraycopy(results, zi * yLevels, slice, 0, yLevels);
++                    }
++                } else {
++                    // GPU timed out — fall back to CPU for this interpolator
++                    for (int zi = 0; zi < zColumns; zi++) {
++                        double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                        int i1 = this.firstCellZ + zi;
++                        this.cellStartBlockZ = i1 * this.cellWidth;
++                        this.inCellZ = 0;
++                        long cpuStart = System.nanoTime();
++                        interp.fillArray(slice, this.sliceFillingContextProvider);
++                        io.papermc.paper.gpu.GlassPaperBenchmark.recordCpu(
++                            System.nanoTime() - cpuStart);
++                    }
++                }
++            } else {
++                for (int zi = 0; zi < zColumns; zi++) {
++                    double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                    int i1 = this.firstCellZ + zi;
++                    this.cellStartBlockZ = i1 * this.cellWidth;
++                    this.inCellZ = 0;
++                    long cpuStart = System.nanoTime();
++                    interp.fillArray(slice, this.sliceFillingContextProvider);
++                    io.papermc.paper.gpu.GlassPaperBenchmark.recordCpu(
++                        System.nanoTime() - cpuStart);
++                }
++            }
++        }
++
++        this.arrayInterpolationCounter++;
++    }
++
++    /**
++     * Attempts to evaluate an interpolator's density function for all positions
++     * using the GPU. Returns null if the function cannot be GPU-evaluated,
++     * in which case the caller must fall back to CPU.
++     *
++     * Currently supported: DensityFunctions.Noise (single NormalNoise sampler).
++     * Phase 5 will add support for the full composed density function tree.
++     */
++
+     public void initializeForFirstCellX() {
+         if (this.interpolating) {
+             throw new IllegalStateException("Staring interpolation twice");

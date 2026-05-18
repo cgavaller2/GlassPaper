@@ -3,14 +3,8 @@ package io.papermc.paper.gpu;
 import org.jocl.*;
 import static org.jocl.CL.*;
 
-/**
- * Holds pre-uploaded GPU buffers for a CompiledDensityFunction.
- * Created once per unique density function tree, reused for every dispatch.
- * Only positions and output buffers are allocated per-dispatch.
- */
 public final class GpuCompiledKernel implements AutoCloseable {
 
-    // Static buffers — uploaded once at construction, never change
     final cl_mem iOpsBuf;
     final cl_mem dArgsBuf;
     final cl_mem noiseParamsBuf;
@@ -20,25 +14,32 @@ public final class GpuCompiledKernel implements AutoCloseable {
     final cl_mem splineHeadersBuf;
     final cl_mem splineFloatPoolBuf;
     final cl_mem splineChildrenBuf;
+    final cl_mem blendedScalarsBuf;
+    final cl_mem blendedPerlinFactorsBuf;
+    final cl_mem blendedPerlinInfoBuf;
 
     private GpuCompiledKernel(
         cl_mem iOpsBuf, cl_mem dArgsBuf,
         cl_mem noiseParamsBuf, cl_mem noiseInfoBuf,
         cl_mem octaveParamsBuf, cl_mem permTablesBuf,
         cl_mem splineHeadersBuf, cl_mem splineFloatPoolBuf,
-        cl_mem splineChildrenBuf) {
-        this.iOpsBuf           = iOpsBuf;
-        this.dArgsBuf          = dArgsBuf;
-        this.noiseParamsBuf    = noiseParamsBuf;
-        this.noiseInfoBuf      = noiseInfoBuf;
-        this.octaveParamsBuf   = octaveParamsBuf;
-        this.permTablesBuf     = permTablesBuf;
-        this.splineHeadersBuf  = splineHeadersBuf;
-        this.splineFloatPoolBuf= splineFloatPoolBuf;
-        this.splineChildrenBuf = splineChildrenBuf;
+        cl_mem splineChildrenBuf,
+        cl_mem blendedScalarsBuf, cl_mem blendedPerlinFactorsBuf,
+        cl_mem blendedPerlinInfoBuf) {
+        this.iOpsBuf                = iOpsBuf;
+        this.dArgsBuf               = dArgsBuf;
+        this.noiseParamsBuf         = noiseParamsBuf;
+        this.noiseInfoBuf           = noiseInfoBuf;
+        this.octaveParamsBuf        = octaveParamsBuf;
+        this.permTablesBuf          = permTablesBuf;
+        this.splineHeadersBuf       = splineHeadersBuf;
+        this.splineFloatPoolBuf     = splineFloatPoolBuf;
+        this.splineChildrenBuf      = splineChildrenBuf;
+        this.blendedScalarsBuf      = blendedScalarsBuf;
+        this.blendedPerlinFactorsBuf= blendedPerlinFactorsBuf;
+        this.blendedPerlinInfoBuf   = blendedPerlinInfoBuf;
     }
 
-    /** Upload all static buffers to GPU once. */
     public static GpuCompiledKernel upload(GpuContext ctx, CompiledDensityFunction cdf) {
         return new GpuCompiledKernel(
             buf(ctx, cdf.iOps.length > 0
@@ -67,7 +68,16 @@ public final class GpuCompiledKernel implements AutoCloseable {
                 (long) Sizeof.cl_float * Math.max(1, cdf.splineFloatPool.length)),
             buf(ctx, cdf.splineChildren.length > 0
                     ? Pointer.to(cdf.splineChildren) : Pointer.to(new int[1]),
-                (long) Sizeof.cl_int * Math.max(1, cdf.splineChildren.length))
+                (long) Sizeof.cl_int * Math.max(1, cdf.splineChildren.length)),
+            buf(ctx, cdf.blendedScalars.length > 0
+                    ? Pointer.to(cdf.blendedScalars) : Pointer.to(new double[1]),
+                (long) Sizeof.cl_double * Math.max(1, cdf.blendedScalars.length)),
+            buf(ctx, cdf.blendedPerlinFactors.length > 0
+                    ? Pointer.to(cdf.blendedPerlinFactors) : Pointer.to(new double[1]),
+                (long) Sizeof.cl_double * Math.max(1, cdf.blendedPerlinFactors.length)),
+            buf(ctx, cdf.blendedPerlinInfo.length > 0
+                    ? Pointer.to(cdf.blendedPerlinInfo) : Pointer.to(new int[1]),
+                (long) Sizeof.cl_int * Math.max(1, cdf.blendedPerlinInfo.length))
         );
     }
 
@@ -87,5 +97,8 @@ public final class GpuCompiledKernel implements AutoCloseable {
         clReleaseMemObject(splineHeadersBuf);
         clReleaseMemObject(splineFloatPoolBuf);
         clReleaseMemObject(splineChildrenBuf);
+        clReleaseMemObject(blendedScalarsBuf);
+        clReleaseMemObject(blendedPerlinFactorsBuf);
+        clReleaseMemObject(blendedPerlinInfoBuf);
     }
 }

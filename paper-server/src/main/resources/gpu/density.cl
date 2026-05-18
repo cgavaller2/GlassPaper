@@ -96,6 +96,187 @@ static double evalNoise(int ni, double x, double y, double z,
     return (fv+sv)*vf;
 }
 
+// ── ImprovedNoise.noise(x,y,z,yScale,yMax) — full deprecated path ────────────
+// Used by BlendedNoise internally
+static double improvedNoiseYScale(
+    double x, double y, double z,
+    double xo, double yo, double zo,
+    double yScale, double yMax,
+    __global const uchar* p)
+{
+    double dx = x + xo;
+    double dy = y + yo;
+    double dz = z + zo;
+    int gx = (int)floor(dx);
+    int gy = (int)floor(dy);
+    int gz = (int)floor(dz);
+    double deltaX = dx - gx;
+    double deltaY = dy - gy;
+    double deltaZ = dz - gz;
+
+    double d7;
+    if (yScale != 0.0) {
+        double d6 = (yMax >= 0.0 && yMax < deltaY) ? yMax : deltaY;
+        d7 = floor(d6 / yScale + 1.0e-7f) * yScale;
+    } else {
+        d7 = 0.0;
+    }
+    return sampleAndLerp(gx, gy, gz, deltaX, deltaY - d7, deltaZ, deltaY, p);
+}
+
+// ── PerlinNoise.getValue with yScale/yMax (used by BlendedNoise) ─────────────
+static double perlinGetValueYScale(
+    double x, double y, double z,
+    double yScale, double yMax,
+    double inputF, double valueF,
+    int nOct, int octBase,
+    __global const double* octP,
+    __global const uchar*  perms)
+{
+    double result = 0.0;
+    double is = inputF, vs = valueF;
+    for (int i = 0; i < nOct; i++) {
+        int pb = (octBase + i) * 4;
+        double amp = octP[pb];
+        if (amp != 0.0) {
+            __global const uchar* pt = perms + (long)(octBase + i) * 256;
+            double xo = octP[pb+1], yo = octP[pb+2], zo = octP[pb+3];
+            double n = improvedNoiseYScale(
+                wrapNoise(x * is), wrapNoise(y * is), wrapNoise(z * is),
+                xo, yo, zo,
+                yScale * is, yMax * is, pt);
+            result += amp * n * vs;
+        }
+        is *= 2.0; vs /= 2.0;
+    }
+    return result;
+}
+
+// ── BlendedNoise.compute(x,y,z) ──────────────────────────────────────────────
+// bi = blended noise index
+// blendedScalars:       5 doubles per instance [xzMul, yMul, xzFac, yFac, smear]
+// blendedPerlinFactors: 6 doubles per instance [minIF, minVF, maxIF, maxVF, mainIF, mainVF]
+// blendedPerlinInfo:    6 ints per instance    [minOff, maxOff, mainOff, minCnt, maxCnt, mainCnt]
+static double evalBlendedNoise(
+    int bi, double x, double y, double z,
+    __global const double* blendedScalars,
+    __global const double* blendedPerlinFactors,
+    __global const int*    blendedPerlinInfo,
+    __global const double* octaveParams,
+    __global const uchar*  permTables)
+{
+    int sb = bi * 5;
+    double xzMul  = blendedScalars[sb+0];
+    double yMul   = blendedScalars[sb+1];
+    double xzFac  = blendedScalars[sb+2];
+    double yFac   = blendedScalars[sb+3];
+    double smear  = blendedScalars[sb+4];
+
+    int fb = bi * 6;
+    double minIF  = blendedPerlinFactors[fb+0];
+    double minVF  = blendedPerlinFactors[fb+1];
+    double maxIF  = blendedPerlinFactors[fb+2];
+    double maxVF  = blendedPerlinFactors[fb+3];
+    double mainIF = blendedPerlinFactors[fb+4];
+    double mainVF = blendedPerlinFactors[fb+5];
+
+    int ib = bi * 6;
+    int minOff   = blendedPerlinInfo[ib+0];
+    int maxOff   = blendedPerlinInfo[ib+1];
+    int mainOff  = blendedPerlinInfo[ib+2];
+    int minCnt   = blendedPerlinInfo[ib+3];
+    int maxCnt   = blendedPerlinInfo[ib+4];
+    int mainCnt  = blendedPerlinInfo[ib+5];
+
+    double d  = x * xzMul;
+    double d1 = y * yMul;
+    double d2 = z * xzMul;
+    double d3 = d  / xzFac;
+    double d4 = d1 / yFac;
+    double d5 = d2 / xzFac;
+    double d6 = yMul * smear;
+    double d7 = d6  / yFac;
+
+    // ── Main noise (8 octaves) ────────────────────────────────────────────────
+    double d10 = 0.0;
+    double scale = 1.0;
+    for (int i = 0; i < 8 && i < mainCnt; i++) {
+            int pb = (mainOff + (mainCnt - 1 - i)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(mainOff + (mainCnt - 1 - i)) * 256;
+            double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+            d10 += improvedNoiseYScale(
+                wrapNoise(d3 * scale), wrapNoise(d4 * scale), wrapNoise(d5 * scale),
+                xo, yo, zo,
+                d7 * scale, d4 * scale, pt) / scale;
+        }
+        scale /= 2.0;
+    }
+
+    double d12 = (d10 / 10.0 + 1.0) / 2.0;
+    d12 = clamp(d12, 0.0, 1.0);
+    int flag1 = (d12 >= 1.0) ? 1 : 0;
+    int flag2 = (d12 <= 0.0) ? 1 : 0;
+
+    // ── Min/Max limit noise (16 octaves each) ─────────────────────────────────
+    double d8 = 0.0, d9 = 0.0;
+    scale = 1.0;
+    for (int i1 = 0; i1 < 16 && (i1 < minCnt || i1 < maxCnt); i1++) {
+        double d13 = wrapNoise(d  * scale);
+        double d14 = wrapNoise(d1 * scale);
+        double d15 = wrapNoise(d2 * scale);
+        double d16 = d6 * scale;
+
+        if (!flag1 && i1 < minCnt) {
+            int pb = (minOff + (minCnt - 1 - i1)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(minOff + (minCnt - 1 - i1)) * 256;
+                double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+                d8 += improvedNoiseYScale(d13, d14, d15, xo, yo, zo,
+                    d16, d1 * scale, pt) / scale;
+            }
+        }
+        if (!flag2 && i1 < maxCnt) {
+            int pb = (maxOff + (maxCnt - 1 - i1)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(maxOff + (maxCnt - 1 - i1)) * 256;
+                double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+                d9 += improvedNoiseYScale(d13, d14, d15, xo, yo, zo,
+                    d16, d1 * scale, pt) / scale;
+            }
+        }
+        scale /= 2.0;
+    }
+
+    // clampedLerp(d12, d8/512, d9/512) / 128
+    double lo = d8 / 512.0;
+    double hi = d9 / 512.0;
+    double result;
+    if (d12 <= 0.0) result = lo;
+    else if (d12 >= 1.0) result = hi;
+    else result = lo + d12 * (hi - lo);
+    return result / 128.0;
+}
+
+// ── NoiseRouterData.QuantizedSpaghettiRarity ──────────────────────────────────
+static double getSpaghettiRarity3D(double v) {
+    if (v < -0.5) return 0.75;
+    if (v <  0.0) return 1.0;
+    if (v <  0.5) return 1.5;
+    return 2.0;
+}
+
+static double getSphaghettiRarity2D(double v) {
+    if (v < -0.75) return 0.5;
+    if (v < -0.5)  return 0.75;
+    if (v <  0.5)  return 1.0;
+    if (v <  0.75) return 2.0;
+    return 3.0;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SECTION 2 — Spline evaluator (depth-limited, 3 levels)
 // ═══════════════════════════════════════════════════════════════════
@@ -236,12 +417,17 @@ static float evalSplineD2(int idx, float c0, float c1, float c2,
 #define STACK_SIZE 64
 #define MAX_ITERS 4096
 
+#define OP_SHIFT_B_NOISE     24
+#define OP_BLENDED_NOISE     25
+
+#define OP_WEIRD_SCALED_SAMPLER 26
+
 // ═══════════════════════════════════════════════════════════════════
 //  SECTION 4 — Kernels
 // ═══════════════════════════════════════════════════════════════════
 
 __kernel void evalDensityTree(
-    __global const double* positions,    // 3 doubles per point: x, y, z
+    __global const double* positions,
     __global const int*    iOps,
     __global const double* dArgs,
     __global const double* noiseParams,
@@ -251,6 +437,9 @@ __kernel void evalDensityTree(
     __global const int*    splineHeaders,
     __global const float*  splineFloatPool,
     __global const int*    splineChildren,
+    __global const double* blendedScalars,
+    __global const double* blendedPerlinFactors,
+    __global const int*    blendedPerlinInfo,
     __global       double* output,
     int count)
 {
@@ -313,6 +502,40 @@ __kernel void evalDensityTree(
             double sz=stack[--sp], sy=stack[--sp], sx=stack[--sp];
             stack[sp++]=evalNoise(ni,x*xzS+sx,y*yS+sy,z*xzS+sz,
                 noiseParams,noiseInfo,octaveParams,permTables);
+            break;
+        }
+
+        case OP_SHIFT_B_NOISE: {
+            int ni=(int)iOps[ip++];
+            double xzS=dArgs[dp++];
+            double sz=stack[--sp], sy=stack[--sp], sx=stack[--sp];
+            // ShiftB: getValue(z*xzS + sx, x*xzS + sy, 0 + sz)
+            // matches Java: offsetNoise.getValue(z*0.25, x*0.25, 0.0)
+            stack[sp++]=evalNoise(ni, z*xzS+sx, x*xzS+sy, 0.0+sz,
+                noiseParams,noiseInfo,octaveParams,permTables);
+            break;
+        }
+
+        case OP_BLENDED_NOISE: {
+            int bi = iOps[ip++];
+            if (sp >= STACK_SIZE) { output[id] = 0.0; return; }
+            stack[sp++] = evalBlendedNoise(bi, x, y, z,
+                blendedScalars, blendedPerlinFactors, blendedPerlinInfo,
+                octaveParams, permTables);
+            break;
+        }
+
+        case OP_WEIRD_SCALED_SAMPLER: {
+            int ni         = iOps[ip++];
+            int mapperType = iOps[ip++];
+            double input   = stack[--sp];
+            double d = (mapperType == 0)
+                ? getSpaghettiRarity3D(input)
+                : getSphaghettiRarity2D(input);
+            // d * abs(noise.getValue(x/d, y/d, z/d))
+            double nx = evalNoise(ni, x/d, y/d, z/d,
+                noiseParams, noiseInfo, octaveParams, permTables);
+            stack[sp++] = d * fabs(nx);
             break;
         }
 

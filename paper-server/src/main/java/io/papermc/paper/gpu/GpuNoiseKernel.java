@@ -195,8 +195,11 @@ public final class GpuNoiseKernel {
             clSetKernelArg(k,  7, Sizeof.cl_mem, Pointer.to(gpuKernel.splineHeadersBuf));
             clSetKernelArg(k,  8, Sizeof.cl_mem, Pointer.to(gpuKernel.splineFloatPoolBuf));
             clSetKernelArg(k,  9, Sizeof.cl_mem, Pointer.to(gpuKernel.splineChildrenBuf));
-            clSetKernelArg(k, 10, Sizeof.cl_mem, Pointer.to(outBuf));
-            clSetKernelArg(k, 11, Sizeof.cl_int, Pointer.to(new int[]{count}));
+            clSetKernelArg(k, 10, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedScalarsBuf));
+            clSetKernelArg(k, 11, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinFactorsBuf));
+            clSetKernelArg(k, 12, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinInfoBuf));
+            clSetKernelArg(k, 13, Sizeof.cl_mem, Pointer.to(outBuf));
+            clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
             double[] results = new double[count];
             synchronized (ctx.queue()) {

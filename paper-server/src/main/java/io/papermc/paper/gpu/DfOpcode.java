@@ -54,6 +54,13 @@ public final class DfOpcode {
     public static final int ADD_CONST          = 22;  // dArgs: [constant]
     public static final int MUL_CONST          = 23;  // dArgs: [constant]
 
+    public static final int SHIFT_B_NOISE = 24; // like SHIFTED_NOISE but swaps X/Z axes
+    public static final int BLENDED_NOISE = 25; // iArgs: [blendedNoiseIdx]
+
+    public static final int WEIRD_SCALED_SAMPLER = 26; // iArgs: [noise_idx, mapper_type]
+    // mapper_type: 0=TYPE1(3D), 1=TYPE2(2D)
+    // pops input value from stack first
+
     // ── Sentinel ─────────────────────────────────────────────────────────────
     public static final int HALT               = 255;
 }

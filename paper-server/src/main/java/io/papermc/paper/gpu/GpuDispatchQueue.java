@@ -79,9 +79,15 @@ public final class GpuDispatchQueue {
 
         // Block until flusher completes this item
         try {
-            return item.future.get();
+            double[] result = item.future.get(50, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (result != null) return result;
+            // Timed out — return null so caller falls back to CPU
+            return null;
+        } catch (java.util.concurrent.TimeoutException e) {
+            // GPU is overloaded — signal CPU fallback
+            return null;
         } catch (Exception e) {
-            throw new RuntimeException("[GlassPaper] GPU dispatch interrupted", e);
+            return null;
         }
     }
 
