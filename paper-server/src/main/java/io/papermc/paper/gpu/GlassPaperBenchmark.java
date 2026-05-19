@@ -60,6 +60,106 @@ public final class GlassPaperBenchmark {
     private static final int  MAX_RICH_DIAGNOSES = 10;
     private static final AtomicLong richDiagnosed = new AtomicLong();
 
+    /** Tracks which density-function class names have had their bytecode dumped. */
+    private static final java.util.Set<String> bytecodeDumped =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Dump the compiled GPU bytecode for this density function once per type
+     * (keyed on getClass().getSimpleName()), with each opcode annotated.
+     * Called from NoiseChunk.fillSliceGpu on the first mismatch of a given
+     * type — gives us the actual bytecode stream to inspect for runtime bugs.
+     */
+    public static void dumpCompiledBytecode(String typeName,
+                                            net.minecraft.world.level.levelgen.DensityFunction fn) {
+        if (!bytecodeDumped.add(typeName)) return;
+        try {
+            io.papermc.paper.gpu.CompiledDensityFunction cdf =
+                net.minecraft.world.level.levelgen.DensityFunctionCompiler.compile(fn);
+            if (cdf == null) {
+                LOGGER.warning("Bytecode dump for " + typeName + ": compile returned null");
+                return;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("════ Compiled bytecode for ").append(typeName)
+              .append(" (").append(cdf.iOps.length).append(" iOps, ")
+              .append(cdf.dArgs.length).append(" dArgs, ")
+              .append(cdf.octaveParams.length / 4).append(" octaves, ")
+              .append(cdf.blendedScalars.length / 5).append(" blended noises, ")
+              .append(cdf.splineHeaders.length / 4).append(" splines) ════\n");
+
+            int ip = 0, dp = 0;
+            int step = 0;
+            while (ip < cdf.iOps.length && step < 500) {
+                int op = cdf.iOps[ip++];
+                sb.append(String.format("  [%4d] ", step++));
+                switch (op) {
+                    case io.papermc.paper.gpu.DfOpcode.PUSH_CONST:
+                        sb.append("PUSH_CONST ").append(cdf.dArgs[dp++]); break;
+                    case io.papermc.paper.gpu.DfOpcode.PUSH_X: sb.append("PUSH_X");   break;
+                    case io.papermc.paper.gpu.DfOpcode.PUSH_Y: sb.append("PUSH_Y");   break;
+                    case io.papermc.paper.gpu.DfOpcode.PUSH_Z: sb.append("PUSH_Z");   break;
+                    case io.papermc.paper.gpu.DfOpcode.ADD:    sb.append("ADD");      break;
+                    case io.papermc.paper.gpu.DfOpcode.MUL:    sb.append("MUL");      break;
+                    case io.papermc.paper.gpu.DfOpcode.MIN_OP: sb.append("MIN");      break;
+                    case io.papermc.paper.gpu.DfOpcode.MAX_OP: sb.append("MAX");      break;
+                    case io.papermc.paper.gpu.DfOpcode.ABS:    sb.append("ABS");      break;
+                    case io.papermc.paper.gpu.DfOpcode.SQUARE: sb.append("SQUARE");   break;
+                    case io.papermc.paper.gpu.DfOpcode.CUBE:   sb.append("CUBE");     break;
+                    case io.papermc.paper.gpu.DfOpcode.HALF_NEGATIVE:    sb.append("HALF_NEG");    break;
+                    case io.papermc.paper.gpu.DfOpcode.QUARTER_NEGATIVE: sb.append("QUARTER_NEG"); break;
+                    case io.papermc.paper.gpu.DfOpcode.SQUEEZE: sb.append("SQUEEZE"); break;
+                    case io.papermc.paper.gpu.DfOpcode.INVERT:  sb.append("INVERT");  break;
+                    case io.papermc.paper.gpu.DfOpcode.CLAMP:
+                        sb.append(String.format("CLAMP [%g, %g]", cdf.dArgs[dp++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.NOISE:
+                        sb.append(String.format("NOISE idx=%d xzS=%g yS=%g",
+                            cdf.iOps[ip++], cdf.dArgs[dp++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.SHIFTED_NOISE:
+                        sb.append(String.format("SHIFTED_NOISE idx=%d xzS=%g yS=%g",
+                            cdf.iOps[ip++], cdf.dArgs[dp++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.SHIFT_B_NOISE:
+                        sb.append(String.format("SHIFT_B_NOISE idx=%d xzS=%g",
+                            cdf.iOps[ip++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.Y_GRADIENT:
+                        sb.append(String.format("Y_GRADIENT fy=%d ty=%d fv=%g tv=%g",
+                            cdf.iOps[ip++], cdf.iOps[ip++], cdf.dArgs[dp++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.RANGE_SELECT:
+                        sb.append(String.format("RANGE_SELECT [%g, %g)",
+                            cdf.dArgs[dp++], cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.BLEND_DENSITY_NOOP:
+                        sb.append("BLEND_DENSITY_NOOP"); break;
+                    case io.papermc.paper.gpu.DfOpcode.SPLINE_EVAL:
+                        sb.append(String.format("SPLINE_EVAL spline=%d depth=%d",
+                            cdf.iOps[ip++], cdf.iOps[ip++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.ADD_CONST:
+                        sb.append(String.format("ADD_CONST %g", cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.MUL_CONST:
+                        sb.append(String.format("MUL_CONST %g", cdf.dArgs[dp++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.BLENDED_NOISE:
+                        sb.append(String.format("BLENDED_NOISE bn=%d", cdf.iOps[ip++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.WEIRD_SCALED_SAMPLER:
+                        sb.append(String.format("WEIRD_SCALED_SAMPLER idx=%d mapper=%d",
+                            cdf.iOps[ip++], cdf.iOps[ip++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.HALT:
+                        sb.append("HALT");
+                        ip = cdf.iOps.length;
+                        break;
+                    default:
+                        sb.append("UNKNOWN op=").append(op);
+                        ip = cdf.iOps.length;
+                        break;
+                }
+                sb.append('\n');
+            }
+            if (step >= 500) sb.append("  ... (truncated, ").append(cdf.iOps.length - ip).append(" bytes remaining)\n");
+            LOGGER.warning(sb.toString());
+        } catch (Throwable t) {
+            LOGGER.warning("Bytecode dump failed: " + t.getMessage());
+        }
+    }
+
     /**
      * For RangeChoice mismatches, reflect into the density function and log
      * the input value, both branch values on CPU, and which branch the GPU

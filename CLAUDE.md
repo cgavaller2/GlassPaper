@@ -127,8 +127,13 @@ runs this near the spark-enable point, before delayed init tasks:
 - `gpubench` — print `GlassPaperBenchmark.report()`
 - `gpureset` — zero counters
 - `gpuconfig <threshold> <interval_ms>` — retune dispatch queue at runtime
-- `gpuvalidate` — flip a flag for runtime CPU/GPU comparison (the
-  comparison code path was half-installed; check before relying on it)
+- `gpuvalidate` — toggle runtime CPU/GPU comparison. When on,
+  `NoiseChunk.fillSliceGpu` samples every 16th point per dispatch,
+  evaluates on CPU via `SinglePointContext`, and records deltas > 1e-6
+  per density-function class. Report (`gpubench`) shows per-type stats
+  sorted by max delta. For RangeChoice mismatches, the first 10 also
+  get reflection-based introspection logged. For any mismatch, a one-shot
+  bytecode dump of the offending tree is printed.
 
 ### Shutdown (MinecraftServer)
 
@@ -184,23 +189,48 @@ first 10 are rich-diagnosed via reflection — extracts `input`, `min`,
 which branch the GPU output most likely matches. This is what found the
 cache-key bug. Keep it in mind for any future divergence investigation.
 
+### Fixed in Phase 9.2 (commit "GlassPaper: Phase 9.2 depth-4 spline support and BlendedNoise enabled")
+
+**Depth-4 spline truncation (root cause of swiss-cheese terrain after BlendedNoise re-enabled).**
+The OpenCL `OP_SPLINE_EVAL` handler capped at depth 3:
+```c
+float c2 = (depth >= 3) ? (float)stack[--sp] : 0.0f;
+for (int extra = 3; extra < depth; extra++) --sp;  // popped but ignored
+// dispatched to evalSplineD2 even for depth=4
+```
+Vanilla MC 1.21's overworld splines nest 4 deep (continentalness → erosion
+→ weirdness → ridges). The deepest coordinate got popped from the stack
+but never used in the spline evaluation. With BlendedNoise CPU-fallback,
+this bug was invisible — the final density tree never made it onto the
+GPU. After re-enabling BlendedNoise, the depth-4 splines started being
+evaluated as depth-3, producing wrong terrain shape. Fixed by adding
+`evalSplineD3` and dispatching depth=4 to it. README's claim that
+"deeper splines fall back to CPU" was wrong — there was no actual
+fallback, just silent truncation.
+
+**BlendedNoise GPU compilation re-enabled.** The `fail("BlendedNoise: temporarily disabled")`
+guard in `DensityFunctionCompiler` is removed. BlendedNoise now compiles
+to the existing `OP_BLENDED_NOISE` bytecode that was already implemented
+in `density.cl`. The startup `validateBlendedNoise` call is wired into
+`MinecraftServer` post-kernel-store as a non-gating correctness check.
+
+**Validator now dumps bytecode on first mismatch per type.** When a
+runtime CPU/GPU divergence is detected, the compiled bytecode for that
+density tree is logged once (annotated opcode-by-opcode) so an operator
+can see what tree shape diverged. This is what surfaced the depth-4
+spline truncation.
+
+**registerBlendedNoise log spam removed.** Was emitting an INFO line per
+chunk-gen compile (each compile creates a fresh `DensityFunctionCompiler`,
+so the IdentityHashMap dedup never triggers across compiles). Removed.
+
 ### Currently disabled / open
 
-**BlendedNoise GPU compilation** is hardcoded-disabled at
-`DensityFunctionCompiler.java` around line 400:
-```java
-if (fn instanceof BlendedNoise bn) {
-    fail("BlendedNoise: temporarily disabled for debugging");
-    return;
-}
-```
-This was disabled during a previous debugging session and never re-enabled.
-Result: every density tree containing BlendedNoise falls back to CPU (~50%
-of dispatches). Re-enabling is the obvious next step — the validation
-infrastructure can now catch BlendedNoise correctness issues automatically.
-The `GpuNoiseValidator.validateBlendedNoise` startup check exists but is
-not called from `MinecraftServer` in the current recovered code (Local
-History gave back a version without the call).
+**Spline depth > 4** is not yet supported. `OP_SPLINE_EVAL` drains the
+stack and dispatches to `evalSplineD3` for any `depth >= 4`, so depth-5+
+splines will produce wrong values but stay stack-balanced. Vanilla MC
+1.21 overworld doesn't appear to use depth > 4; revisit if a different
+dimension or modded noise router does.
 
 **CacheOnce / CacheAllInCell bypass.** `fillSliceGpu` writes directly into
 `interp.slice0/slice1` via `arraycopy` instead of calling
@@ -208,8 +238,18 @@ History gave back a version without the call).
 `CacheOnce` or `CacheAllInCell` nodes that vanilla relies on for
 downstream cache hits in `selectCellYZ → cacheAllInCell.noiseFiller.fillArray`.
 Verified non-correctness-impacting (`arrayInterpolationCounter` can't
-collide with stale values), but leaves CPU work on the table. Possible
-follow-up perf win.
+collide with stale values), but leaves CPU work on the table. **Highest-value
+remaining perf win** — priming those caches from GPU output should cut
+substantial CPU re-evaluation work.
+
+**Single OpenCL command queue.** All workers share one `cl_command_queue`
+serialized via `synchronized` block in `GpuNoiseKernel`. Phase 8 plan
+was per-thread queues for parallel dispatch.
+
+**Blended-chunk boundary fallback.** When `blender != Blender.empty()`
+(chunks at the boundary of existing terrain), `fillSliceGpu` is skipped
+and CPU runs the slice. ~800 such chunks per session in current testing.
+Phase 9 roadmap was to handle these on GPU too.
 
 ## File map
 
@@ -232,23 +272,36 @@ bundled into one feature patch:
 
 ## Performance snapshot
 
-RTX 2080 Ti + i9-14900K, Windows.
+RTX 2080 Ti + i9-14900K, Windows. All numbers with `gpuvalidate` ON
+(validation adds CPU overhead — real throughput off validator is
+somewhat higher).
 
-Phase 9.1 (current, cache-key fix in, BlendedNoise still CPU-only):
-- ~2,112 samples/ms throughput
+Phase 9.2 (current, BlendedNoise + depth-4 splines on GPU, terrain correct):
+- ~1,222 samples/ms throughput
+- ~0.47 ms avg/dispatch
+- **0 CPU fallbacks** for non-blended chunks (~800 blender-boundary
+  fallbacks per session, expected)
+- All density-function types compile and run on GPU
+- 146M points evaluated per ~30s of exploration
+
+Phase 9.1 (BlendedNoise still CPU-only, ~50% CPU fallback):
+- ~2,112 samples/ms throughput (higher number, but only because half
+  the work was offloaded to CPU)
 - ~0.17 ms avg/dispatch
-- ~51% CPU fallback rate — driven entirely by BlendedNoise being disabled.
-  Re-enabling BlendedNoise on GPU should reclaim most of this.
 
-Phase 7 (Cross-chunk batch coalescing, before the cache-key bug was found
-or fixed — these numbers were achievable but with terrain artifacts):
-- ~2,884 samples/ms throughput
-- ~0.13 ms avg/dispatch
-- ~38% CPU fallback rate
+The Phase 9.1 vs 9.2 throughput drop is because GPU is now doing *more
+real work* per dispatch (BlendedNoise's 40 octaves), not because it
+got slower. Total GPU work output is up substantially.
 
-The intent is to get back to (and past) Phase 7 throughput now that the
-correctness bugs are out of the way — re-enable BlendedNoise, then look
-at the CacheOnce bypass and the remaining queue lock.
+The Phase 7 stated "2,884 samples/ms" was measured with both the
+cache-key collision and the depth-4 spline truncation bugs live — fast
+but wrong. Not a real baseline.
+
+Next perf wins, in priority order:
+1. CacheOnce / CacheAllInCell hookup — biggest expected gain
+2. Per-thread command queues (Phase 8)
+3. Dispatch queue parameter tuning (`gpuconfig`)
+4. Kernel-side optimization (perm-table prefetch, vectorization)
 
 ## Requirements
 

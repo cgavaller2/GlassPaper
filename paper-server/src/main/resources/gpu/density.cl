@@ -311,6 +311,8 @@ static float evalSplineD1(int idx, float c0, float c1,
     __global const int* sh, __global const float* fp, __global const int* ci);
 static float evalSplineD2(int idx, float c0, float c1, float c2,
     __global const int* sh, __global const float* fp, __global const int* ci);
+static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
+    __global const int* sh, __global const float* fp, __global const int* ci);
 
 static float evalSplineD0(int idx, float c0,
     __global const int* sh, __global const float* fp, __global const int* ci)
@@ -381,6 +383,38 @@ static float evalSplineD2(int idx, float c0, float c1, float c2,
     }
     vLo = evalSplineD1(ci[csS+lo],   c1, c2, sh, fp, ci);
     vHi = evalSplineD1(ci[csS+lo+1], c1, c2, sh, fp, ci);
+    return hermiteInterp(c0, lo, K, fpS, vLo, vHi, fp);
+}
+
+// Vanilla MC overworld splines nest 4 deep (continentalness -> erosion ->
+// weirdness -> ridges). The earlier 3-level cap silently truncated the
+// deepest coordinate, producing wrong terrain shape that propagated through
+// the final density tree as BlendDensity divergence.
+static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
+    __global const int* sh, __global const float* fp, __global const int* ci)
+{
+    int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
+    if (type == 0) return fp[fpS];
+    if (type == 1) {
+        int vS = sh[b+3];
+        int lo = findKnot(c0, K, fpS, fp);
+        if (lo < 0)    return fp[vS]      + fp[fpS+K]      * (c0 - fp[fpS]);
+        if (lo >= K-1) return fp[vS+K-1]  + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+        return hermiteInterp(c0, lo, K, fpS, fp[vS+lo], fp[vS+lo+1], fp);
+    }
+    int csS = sh[b+3];
+    int lo  = findKnot(c0, K, fpS, fp);
+    float vLo, vHi;
+    if (lo < 0) {
+        vLo = evalSplineD2(ci[csS], c1, c2, c3, sh, fp, ci);
+        return vLo + fp[fpS+K] * (c0 - fp[fpS]);
+    }
+    if (lo >= K-1) {
+        vLo = evalSplineD2(ci[csS+K-1], c1, c2, c3, sh, fp, ci);
+        return vLo + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+    }
+    vLo = evalSplineD2(ci[csS+lo],   c1, c2, c3, sh, fp, ci);
+    vHi = evalSplineD2(ci[csS+lo+1], c1, c2, c3, sh, fp, ci);
     return hermiteInterp(c0, lo, K, fpS, vLo, vHi, fp);
 }
 
@@ -560,17 +594,20 @@ __kernel void evalDensityTree(
             int si    = iOps[ip++];
             int depth = iOps[ip++];
 
-            // Pop coords: c0=outermost (top of stack), c1, c2
+            // Pop coords: c0=outermost (top of stack), c1, c2, c3 (deepest)
             float c0 = (depth >= 1) ? (float)stack[--sp] : 0.0f;
             float c1 = (depth >= 2) ? (float)stack[--sp] : 0.0f;
             float c2 = (depth >= 3) ? (float)stack[--sp] : 0.0f;
-            // consume remaining if depth > 3 (shouldn't happen)
-            for (int extra = 3; extra < depth; extra++) --sp;
+            float c3 = (depth >= 4) ? (float)stack[--sp] : 0.0f;
+            // Drain any deeper coords (depth > 4) — not yet supported,
+            // the result will be wrong but stack stays balanced.
+            for (int extra = 4; extra < depth; extra++) --sp;
 
             float r;
             if      (depth <= 1) r = evalSplineD0(si, c0, splineHeaders, splineFloatPool, splineChildren);
             else if (depth == 2) r = evalSplineD1(si, c0, c1, splineHeaders, splineFloatPool, splineChildren);
-            else                 r = evalSplineD2(si, c0, c1, c2, splineHeaders, splineFloatPool, splineChildren);
+            else if (depth == 3) r = evalSplineD2(si, c0, c1, c2, splineHeaders, splineFloatPool, splineChildren);
+            else                 r = evalSplineD3(si, c0, c1, c2, c3, splineHeaders, splineFloatPool, splineChildren);
 
             stack[sp++] = (double)r;
             break;

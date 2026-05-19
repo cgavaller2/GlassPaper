@@ -21,8 +21,6 @@ public final class GpuKernelHolder {
     public static GpuNoiseKernel get()            { return instance; }
     public static boolean isAvailable()           { return instance != null; }
 
-    private static volatile boolean blendDensityLogged = false;
-
     /**
      * Compile the density function and return pre-uploaded GPU buffers.
      * Identical trees reuse the same GPU buffers indefinitely.
@@ -36,16 +34,6 @@ public final class GpuKernelHolder {
         CompiledDensityFunction cdf =
             net.minecraft.world.level.levelgen.DensityFunctionCompiler.compile(fn);
         if (cdf == null) return null;
-
-        if (fn.getClass().getSimpleName().equals("BlendDensity") && !blendDensityLogged) {
-            blendDensityLogged = true;
-            StringBuilder sb = new StringBuilder("BlendDensity iOps: ");
-            for (int op : cdf.iOps) sb.append(op).append(",");
-            java.util.logging.Logger.getLogger("GlassPaper").info(sb.toString());
-            sb = new StringBuilder("BlendDensity dArgs count: " + cdf.dArgs.length
-                + " octaves: " + (cdf.octaveParams.length/4));
-            java.util.logging.Logger.getLogger("GlassPaper").info(sb.toString());
-        }
 
         // 2. Key by content — identical programs share one GPU buffer set
         DfCacheKey key = DfCacheKey.of(cdf);

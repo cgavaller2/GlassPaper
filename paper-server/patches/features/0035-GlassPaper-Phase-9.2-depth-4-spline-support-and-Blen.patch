@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Mon, 18 May 2026 19:15:44 -0500
+Subject: [PATCH] GlassPaper: Phase 9.2 depth-4 spline support and BlendedNoise
+ enabled
+
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 90318bdbe021c93f86370ad0bda25b0fba6b0120..07d0a403f72c64e857e636ca3d456d5b4f689838 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1285,6 +1285,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+                         boolean normalNoiseValid = io.papermc.paper.gpu.GpuNoiseValidator.validateNormalNoise(kernel);
+                         if (normalNoiseValid) {
+                             io.papermc.paper.gpu.GpuKernelHolder.set(kernel);
++                            // GlassPaper: BlendedNoise correctness check — non-gating,
++                            // logs PASS/FAIL but doesn't disable the GPU path. Run after
++                            // kernel is stored so it never hits a released kernel.
++                            io.papermc.paper.gpu.GpuNoiseValidator.validateBlendedNoise(kernel);
+                             // GlassPaper: start GPU dispatch queue
+                             // Defaults: flush at 4096 points OR every 2ms — tune with gpuconfig command
+                             io.papermc.paper.gpu.GpuDispatchQueue dispatchQueue = new io.papermc.paper.gpu.GpuDispatchQueue(kernel, 256, 1L);
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+index 14d396386b7c64bbc1270ea2a22208df0f2e69f2..8e76725ab5871442679dee6d54d7d8d2ee894c5e 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -406,7 +406,10 @@ public final class DensityFunctionCompiler {
+ 
+         // BlendedNoise
+         if (fn instanceof net.minecraft.world.level.levelgen.synth.BlendedNoise bn) {
+-            fail("BlendedNoise: temporarily disabled for debugging");
++            int idx = registerBlendedNoise(bn);
++            if (failed) return;
++            iOps.add(DfOpcode.BLENDED_NOISE);
++            iOps.add(idx);
+             return;
+         }
+ 
+@@ -713,13 +716,6 @@ public final class DensityFunctionCompiler {
+                 minLevels.length, maxLevels.length, mainLevels.length
+             });
+ 
+-            LOGGER.info(String.format(
+-                "BlendedNoise registered: idx=%d " +
+-                    "minOff=%d minCnt=%d maxOff=%d maxCnt=%d mainOff=%d mainCnt=%d " +
+-                    "xzMul=%.4f yMul=%.4f xzFac=%.4f yFac=%.4f smear=%.4f",
+-                idx, minOff, minLevels.length, maxOff, maxLevels.length,
+-                mainOff, mainLevels.length, xzMul, yMul, xzFac, yFac, smear));
+-
+         } catch (Exception e) {
+             fail("BlendedNoise registration failed: " + e.getMessage());
+         }
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index df80c395a0b55f36eec88b56a60166950e4e812c..7d3acb0ca2131f25c789088f5867fcfc2e0a4315 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -367,6 +367,8 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+                                     typeName, delta, (int) px, (int) py, (int) pz, cpuVal, gpuVal);
+                                 io.papermc.paper.gpu.GlassPaperBenchmark.diagnoseRangeChoice(
+                                     validateFn, px, py, pz, cpuVal, gpuVal);
++                                io.papermc.paper.gpu.GlassPaperBenchmark.dumpCompiledBytecode(
++                                    typeName, validateFn);
+                             }
+                         }
+                     }
