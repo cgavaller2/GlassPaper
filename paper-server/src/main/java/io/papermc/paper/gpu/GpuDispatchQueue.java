@@ -5,6 +5,10 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
@@ -42,6 +46,15 @@ public final class GpuDispatchQueue {
     private final Thread flusherThread;
     private volatile boolean running = true;
 
+    // Phase 9.5 — multi-flusher dispatch pool. The coordinator thread
+    // (flusherThread) drains the pending queue and groups work by kernel,
+    // then submits each group as a parallel task. Up to DISPATCH_POOL_SIZE
+    // groups dispatch concurrently, each using one of the per-slot OpenCL
+    // queues from GpuNoiseKernel. Matches the slot/queue count so we never
+    // contend on the slot pool.
+    private static final int DISPATCH_POOL_SIZE = GpuContext.DENSITY_QUEUE_COUNT;
+    private final ExecutorService dispatchPool;
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     public GpuDispatchQueue(GpuNoiseKernel kernel, int flushThreshold, long flushIntervalMs) {
@@ -49,14 +62,24 @@ public final class GpuDispatchQueue {
         this.flushThreshold   = flushThreshold;
         this.flushIntervalMs  = flushIntervalMs;
 
+        // Daemon-thread executor so JVM shutdown isn't blocked.
+        final AtomicInteger threadId = new AtomicInteger();
+        this.dispatchPool = Executors.newFixedThreadPool(DISPATCH_POOL_SIZE, r -> {
+            Thread t = new Thread(r, "GlassPaper-GPU-Dispatch-" + threadId.getAndIncrement());
+            t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY + 1);
+            return t;
+        });
+
         this.flusherThread = new Thread(this::flusherLoop, "GlassPaper-GPU-Flusher");
         this.flusherThread.setDaemon(true);
         this.flusherThread.setPriority(Thread.NORM_PRIORITY + 1);
         this.flusherThread.start();
 
         LOGGER.info(String.format(
-            "GPU dispatch queue started (threshold=%d points, interval=%dms)",
-            flushThreshold, flushIntervalMs));
+            "GPU dispatch queue started (threshold=%d points, interval=%dms, "
+          + "dispatch pool=%d)",
+            flushThreshold, flushIntervalMs, DISPATCH_POOL_SIZE));
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -120,7 +143,7 @@ public final class GpuDispatchQueue {
     public int getFlushThreshold()  { return flushThreshold;  }
     public long getFlushIntervalMs(){ return flushIntervalMs; }
 
-    /** Flush remaining work and stop the flusher thread. */
+    /** Flush remaining work and stop the flusher thread + dispatch pool. */
     public void shutdown() {
         running = false;
         synchronized (flusherThread) {
@@ -129,6 +152,17 @@ public final class GpuDispatchQueue {
         try {
             flusherThread.join(2000);
         } catch (InterruptedException ignored) {}
+
+        dispatchPool.shutdown();
+        try {
+            if (!dispatchPool.awaitTermination(2, TimeUnit.SECONDS)) {
+                dispatchPool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            dispatchPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
         // Unblock waiting workers with a CPU-fallback signal — null tells
         // submit() to return null so the caller runs the work on CPU.
         GpuWorkItem item;
@@ -177,54 +211,85 @@ public final class GpuDispatchQueue {
             byKernel.computeIfAbsent(w.gpuKernel, k -> new ArrayList<>()).add(w);
         }
 
-        // ── 3. One blocking GPU dispatch per kernel group ───────────────────
-        // Pipelining experiments (async enqueue, OOO queue, clFinish-at-end)
-        // failed in practice on NVIDIA + JOCL — either events hang or all
-        // dispatches time out. Stick with the simple per-group blocking
-        // dispatch; the meaningful coalescing happens at the queue layer
-        // (work items for the same kernel merge into one big position array).
+        // ── 3. Parallel GPU dispatch per kernel group ───────────────────────
+        // Phase 9.5 — submit each kernel group to the dispatch pool. Each
+        // worker borrows its own DensitySlot (with a dedicated cl_command_queue
+        // and pre-allocated posBuf/outBuf), so up to DISPATCH_POOL_SIZE groups
+        // run concurrently on the device. We wait for all groups in this
+        // batch to complete before returning, which keeps flush boundaries
+        // clean and bounds the in-flight backlog.
+        //
+        // Earlier pipelining attempts on a SINGLE queue (OOO + cl_event
+        // chains, non-blocking reads + clFinish) hung or timed out. This
+        // design avoids both: per-queue ops are in-order and self-blocking,
+        // and parallelism comes from the thread pool, not from event chains.
+        List<Future<?>> dispatchTasks = new ArrayList<>(byKernel.size());
         for (Map.Entry<GpuCompiledKernel, List<GpuWorkItem>> entry : byKernel.entrySet()) {
-            GpuCompiledKernel ck    = entry.getKey();
-            List<GpuWorkItem> group = entry.getValue();
+            final GpuCompiledKernel ck    = entry.getKey();
+            final List<GpuWorkItem> group = entry.getValue();
+            dispatchTasks.add(dispatchPool.submit(() -> dispatchGroup(ck, group)));
+        }
 
-            // Build merged position array
-            int totalPoints = 0;
-            for (GpuWorkItem w : group) {
-                w.batchOffset = totalPoints;
-                totalPoints  += w.count;
-            }
-
-            double[] mergedPositions = new double[totalPoints * 3];
-            for (GpuWorkItem w : group) {
-                System.arraycopy(w.positions, 0,
-                    mergedPositions, w.batchOffset * 3, w.count * 3);
-            }
-
-            // Single GPU dispatch for the whole group
-            double[] mergedResults;
+        // Wait for all parallel dispatches in this flush to complete.
+        // Bounded timeout in case any dispatch hangs (driver bug, OOM) so
+        // we don't deadlock the flusher thread.
+        for (Future<?> task : dispatchTasks) {
             try {
-                long start = System.nanoTime();
-                mergedResults = kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints);
-                GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
-                GlassPaperBenchmark.recordBatchFlush(totalPoints);
+                task.get(5000, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
-                LOGGER.warning("GPU batch dispatch failed: " + e.getMessage());
-                // Signal CPU fallback to each waiting worker. Zero-filling the
-                // result here would silently corrupt terrain — the caller
-                // interprets a non-null array as a successful GPU dispatch and
-                // copies it straight into the interpolator slice.
-                for (GpuWorkItem w : group) {
-                    w.future.complete(null);
-                }
-                continue;
+                LOGGER.warning("GPU dispatch task failed/timed out: " + e.getMessage());
+                // Task ran on the dispatch pool — its group's futures were
+                // either completed normally or with null inside dispatchGroup,
+                // so workers are not stuck. We just log and move on.
             }
+        }
+    }
 
-            // Split results back to individual futures
+    /**
+     * Runs on a dispatch-pool worker thread. Builds the merged position
+     * array for one kernel group, performs the GPU dispatch (which borrows
+     * a DensitySlot internally), and routes results back to each work item's
+     * future. On failure, completes each future with null so the calling
+     * worker can fall back to CPU evaluation.
+     */
+    private void dispatchGroup(GpuCompiledKernel ck, List<GpuWorkItem> group) {
+        // Build merged position array
+        int totalPoints = 0;
+        for (GpuWorkItem w : group) {
+            w.batchOffset = totalPoints;
+            totalPoints  += w.count;
+        }
+
+        double[] mergedPositions = new double[totalPoints * 3];
+        for (GpuWorkItem w : group) {
+            System.arraycopy(w.positions, 0,
+                mergedPositions, w.batchOffset * 3, w.count * 3);
+        }
+
+        // Single GPU dispatch for the whole group
+        double[] mergedResults;
+        try {
+            long start = System.nanoTime();
+            mergedResults = kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints);
+            GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
+            GlassPaperBenchmark.recordBatchFlush(totalPoints);
+        } catch (Exception e) {
+            LOGGER.warning("GPU batch dispatch failed: " + e.getMessage());
+            // Signal CPU fallback to each waiting worker. Zero-filling the
+            // result here would silently corrupt terrain — the caller
+            // interprets a non-null array as a successful GPU dispatch and
+            // copies it straight into the interpolator slice.
             for (GpuWorkItem w : group) {
-                double[] slice = new double[w.count];
-                System.arraycopy(mergedResults, w.batchOffset, slice, 0, w.count);
-                w.future.complete(slice);
+                w.future.complete(null);
             }
+            return;
+        }
+
+        // Split results back to individual futures
+        for (GpuWorkItem w : group) {
+            double[] slice = new double[w.count];
+            System.arraycopy(mergedResults, w.batchOffset, slice, 0, w.count);
+            w.future.complete(slice);
         }
     }
 }

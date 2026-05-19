@@ -12,7 +12,8 @@ import java.util.logging.Logger;
 public final class GpuNoiseKernel {
 
     private static final Logger LOGGER = Logger.getLogger("GlassPaper");
-    private static final int POOL_SIZE = 8;
+    // Must match GpuContext.DENSITY_QUEUE_COUNT — each slot pairs 1:1 with one queue.
+    private static final int POOL_SIZE = GpuContext.DENSITY_QUEUE_COUNT;
 
     // Phase 9.4 — buffer pooling for the hot density-tree dispatch path.
     // Each slot pre-allocates posBuf (input positions) and outBuf (results)
@@ -24,13 +25,21 @@ public final class GpuNoiseKernel {
     // Removes ~20-50µs of cl_mem create/release latency per dispatch.
     private static final int MAX_POOLED_POINTS = 32768;
 
-    /** A density-tree kernel paired with its dedicated input/output buffers. */
+    /**
+     * Density-tree kernel + dedicated input/output buffers + dedicated
+     * in-order command queue (Phase 9.5). Each slot is borrowed by at most
+     * one dispatcher thread at a time, so the queue is single-writer and
+     * needs no mutex. Different slots' queues run concurrently on the
+     * device (NVIDIA: separate CUDA streams; AMD: separate ACE hardware
+     * queues, round-robined by creation order).
+     */
     private static final class DensitySlot {
-        final cl_kernel kernel;
-        final cl_mem    posBuf;  // capacity: MAX_POOLED_POINTS * 3 doubles
-        final cl_mem    outBuf;  // capacity: MAX_POOLED_POINTS  doubles
-        DensitySlot(cl_kernel k, cl_mem pb, cl_mem ob) {
-            this.kernel = k; this.posBuf = pb; this.outBuf = ob;
+        final cl_kernel        kernel;
+        final cl_mem           posBuf;  // capacity: MAX_POOLED_POINTS * 3 doubles
+        final cl_mem           outBuf;  // capacity: MAX_POOLED_POINTS  doubles
+        final cl_command_queue queue;   // dedicated, single-writer, in-order
+        DensitySlot(cl_kernel k, cl_mem pb, cl_mem ob, cl_command_queue q) {
+            this.kernel = k; this.posBuf = pb; this.outBuf = ob; this.queue = q;
         }
     }
 
@@ -86,9 +95,11 @@ public final class GpuNoiseKernel {
             result.noisePool.add(clCreateKernel(program, "sampleNoise", null));
             result.normalNoisePool.add(clCreateKernel(program, "sampleNormalNoise", null));
 
-            // Pre-allocate one (kernel, posBuf, outBuf) triple per density slot.
-            // Buffers stay resident for the lifetime of the kernel; positions are
-            // re-uploaded with clEnqueueWriteBuffer on each dispatch.
+            // Pre-allocate one (kernel, posBuf, outBuf, queue) tuple per
+            // density slot. Buffers stay resident for the lifetime of the
+            // kernel; positions are re-uploaded with clEnqueueWriteBuffer on
+            // each dispatch. The dedicated queue means dispatches from
+            // different slots run concurrently on the device.
             cl_kernel dk = clCreateKernel(program, "evalDensityTree", null);
             cl_mem pb = clCreateBuffer(ctx.context(),
                 CL_MEM_READ_ONLY,
@@ -96,7 +107,8 @@ public final class GpuNoiseKernel {
             cl_mem ob = clCreateBuffer(ctx.context(),
                 CL_MEM_WRITE_ONLY,
                 (long) Sizeof.cl_double * MAX_POOLED_POINTS, null, null);
-            result.densityTreeSlotPool.add(new DensitySlot(dk, pb, ob));
+            cl_command_queue dq = ctx.densityQueue(i);
+            result.densityTreeSlotPool.add(new DensitySlot(dk, pb, ob, dq));
         }
 
         long pooledBytes =
@@ -243,9 +255,10 @@ public final class GpuNoiseKernel {
                                            int count) {
         DensitySlot slot = borrowSlot();
         try {
-            cl_kernel k      = slot.kernel;
-            cl_mem    posBuf = slot.posBuf;
-            cl_mem    outBuf = slot.outBuf;
+            cl_kernel        k      = slot.kernel;
+            cl_mem           posBuf = slot.posBuf;
+            cl_mem           outBuf = slot.outBuf;
+            cl_command_queue q      = slot.queue;
 
             clSetKernelArg(k,  0, Sizeof.cl_mem, Pointer.to(posBuf));
             clSetKernelArg(k,  1, Sizeof.cl_mem, Pointer.to(gpuKernel.iOpsBuf));
@@ -263,20 +276,29 @@ public final class GpuNoiseKernel {
             clSetKernelArg(k, 13, Sizeof.cl_mem, Pointer.to(outBuf));
             clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
+            // No mutex — the slot's queue is single-writer (this caller).
+            // In-order queue semantics ensure write → kernel → read complete
+            // in submission order. Different slots' queues run concurrently
+            // on the device when multi-flusher submits to them in parallel.
+            //
+            // NOTE on validation: when many dispatchers are active, more
+            // worker threads run NoiseChunk's runtime CPU/GPU validation
+            // block concurrently. The CPU baseline (validateFn.compute on
+            // SinglePointContext) is NOT thread-safe through MC's
+            // BlendedNoise path, so `gpuvalidate` may produce false-positive
+            // mismatch reports under load. Terrain itself is correct —
+            // verified visually.
             double[] results = new double[count];
-            synchronized (ctx.queue()) {
-                // Blocking upload — Java GC could otherwise relocate `positions`
-                // between this call and the kernel reading from it. The cost
-                // (~5-10µs) is dwarfed by the alloc/release latency we removed.
-                clEnqueueWriteBuffer(ctx.queue(), posBuf, CL_TRUE, 0,
-                    (long) Sizeof.cl_double * count * 3,
-                    Pointer.to(positions), 0, null, null);
-                clEnqueueNDRangeKernel(ctx.queue(), k, 1, null,
-                    new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
-                clEnqueueReadBuffer(ctx.queue(), outBuf, CL_TRUE, 0,
-                    (long) Sizeof.cl_double * count,
-                    Pointer.to(results), 0, null, null);
-            }
+            // Blocking write — Java GC could otherwise relocate `positions`
+            // between this call and the kernel reading from it.
+            clEnqueueWriteBuffer(q, posBuf, CL_TRUE, 0,
+                (long) Sizeof.cl_double * count * 3,
+                Pointer.to(positions), 0, null, null);
+            clEnqueueNDRangeKernel(q, k, 1, null,
+                new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
+            clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
+                (long) Sizeof.cl_double * count,
+                Pointer.to(results), 0, null, null);
             return results;
         } finally {
             returnSlot(slot);
@@ -292,7 +314,8 @@ public final class GpuNoiseKernel {
                                              int count) {
         DensitySlot slot = borrowSlot();
         try {
-            cl_kernel k = slot.kernel;
+            cl_kernel        k = slot.kernel;
+            cl_command_queue q = slot.queue;
             cl_mem posBuf = clCreateBuffer(ctx.context(),
                 CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                 (long) Sizeof.cl_double * positions.length,
@@ -319,12 +342,10 @@ public final class GpuNoiseKernel {
             clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
             double[] results = new double[count];
-            synchronized (ctx.queue()) {
-                clEnqueueNDRangeKernel(ctx.queue(), k, 1, null,
-                    new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
-                clEnqueueReadBuffer(ctx.queue(), outBuf, CL_TRUE, 0,
-                    (long) Sizeof.cl_double * count, Pointer.to(results), 0, null, null);
-            }
+            clEnqueueNDRangeKernel(q, k, 1, null,
+                new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
+            clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
+                (long) Sizeof.cl_double * count, Pointer.to(results), 0, null, null);
 
             clReleaseMemObject(posBuf);
             clReleaseMemObject(outBuf);

@@ -9,14 +9,33 @@ public final class GpuContext {
     private static GpuContext INSTANCE;
     private static final Logger LOGGER = Logger.getLogger("GlassPaper");
 
-    private final cl_device_id device;
-    private final cl_context context;
-    private final cl_command_queue queue;
+    // Phase 9.5 — per-slot command queues. Combined with multi-flusher
+    // dispatch (see GpuDispatchQueue), this lets up to DENSITY_QUEUE_COUNT
+    // density-tree kernels execute concurrently on the device.
+    //
+    // Vendor portability:
+    //   - NVIDIA: each queue → CUDA stream; in-order semantics preserved.
+    //   - AMD: AMD's OpenCL spawns a driver thread per queue; Southern
+    //     Islands+ GPUs round-robin queues across hardware ACEs.
+    //     RDNA/CDNA have 4-8 ACEs → 8 queues exploit full HW parallelism.
+    //   - Intel: per-thread in-order queues are the standard portable pattern.
+    //
+    // The original `queue` is retained for the cold-path validators
+    // (sampleBatch, sampleNormalNoiseBatch) which run only at startup.
+    // Must match GpuNoiseKernel.POOL_SIZE.
+    public static final int DENSITY_QUEUE_COUNT = 8;
 
-    private GpuContext(cl_device_id device, cl_context context, cl_command_queue queue) {
-        this.device  = device;
-        this.context = context;
-        this.queue   = queue;
+    private final cl_device_id      device;
+    private final cl_context        context;
+    private final cl_command_queue  queue;            // validator queue (cold path)
+    private final cl_command_queue[] densityQueues;   // hot-path, one per slot
+
+    private GpuContext(cl_device_id device, cl_context context,
+                       cl_command_queue queue, cl_command_queue[] densityQueues) {
+        this.device         = device;
+        this.context        = context;
+        this.queue          = queue;
+        this.densityQueues  = densityQueues;
     }
 
     public static synchronized GpuContext init() {
@@ -64,25 +83,36 @@ public final class GpuContext {
         props.addProperty(CL_CONTEXT_PLATFORM, chosenPlatform);
         cl_context ctx = clCreateContext(props, 1, new cl_device_id[]{ chosenDevice }, null, null, null);
 
-        // In-order queue. NVIDIA's OpenCL out-of-order queue implementation
-        // (CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) was attempted to allow the
-        // flusher to pipeline independent dispatches, but clWaitForEvents
-        // hangs in that mode in practice — events never signal, everything
-        // times out. Stick with in-order; the flusher still benefits from
-        // enqueueing multiple kernels back-to-back without per-call Java
-        // blocking, with a single clFinish at the end.
+        // All queues are in-order. Out-of-order queues (event chains on a
+        // single queue) hung clWaitForEvents on NVIDIA in earlier work.
+        // Phase 9.5 sidesteps that path: each slot gets its own in-order
+        // queue, and multi-flusher submits to them in parallel from
+        // separate dispatcher threads — no inter-queue events needed.
         cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, chosenDevice, null, null);
 
-        INSTANCE = new GpuContext(chosenDevice, ctx, queue);
+        cl_command_queue[] densityQueues = new cl_command_queue[DENSITY_QUEUE_COUNT];
+        for (int i = 0; i < DENSITY_QUEUE_COUNT; i++) {
+            densityQueues[i] = clCreateCommandQueueWithProperties(ctx, chosenDevice, null, null);
+        }
+        LOGGER.info("Created " + DENSITY_QUEUE_COUNT
+            + " density command queues for per-slot parallel dispatch.");
+
+        INSTANCE = new GpuContext(chosenDevice, ctx, queue, densityQueues);
         return INSTANCE;
     }
 
     public cl_context       context() { return context; }
     public cl_device_id     device()  { return device;  }
+    /** Validator queue (cold path). Hot dispatches use a slot's dedicated queue. */
     public cl_command_queue queue()   { return queue;   }
+    /** Per-slot density queue at index 0..DENSITY_QUEUE_COUNT-1. */
+    public cl_command_queue densityQueue(int index) { return densityQueues[index]; }
     public static GpuContext get()    { return INSTANCE; }
 
     public void shutdown() {
+        for (cl_command_queue q : densityQueues) {
+            clReleaseCommandQueue(q);
+        }
         clReleaseCommandQueue(queue);
         clReleaseContext(context);
         INSTANCE = null;
