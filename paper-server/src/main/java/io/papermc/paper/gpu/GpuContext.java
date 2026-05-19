@@ -63,6 +63,14 @@ public final class GpuContext {
         cl_context_properties props = new cl_context_properties();
         props.addProperty(CL_CONTEXT_PLATFORM, chosenPlatform);
         cl_context ctx = clCreateContext(props, 1, new cl_device_id[]{ chosenDevice }, null, null, null);
+
+        // In-order queue. NVIDIA's OpenCL out-of-order queue implementation
+        // (CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) was attempted to allow the
+        // flusher to pipeline independent dispatches, but clWaitForEvents
+        // hangs in that mode in practice — events never signal, everything
+        // times out. Stick with in-order; the flusher still benefits from
+        // enqueueing multiple kernels back-to-back without per-call Java
+        // blocking, with a single clFinish at the end.
         cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, chosenDevice, null, null);
 
         INSTANCE = new GpuContext(chosenDevice, ctx, queue);

@@ -61,6 +61,15 @@ public final class DfOpcode {
     // mapper_type: 0=TYPE1(3D), 1=TYPE2(2D)
     // pops input value from stack first
 
+    // ── Scratch registers (GPU equivalent of NoiseChunk.CacheOnce) ──────────
+    // For density-tree sub-expressions that are referenced multiple times
+    // (vanilla's `cache_once` markers — same NoiseChunk inner instance for
+    // every reference), the compiler emits the inner expression once, stores
+    // the top of stack into a scratch slot, and replaces subsequent references
+    // with a load. STORE peeks (stack stays put), LOAD pushes a copy.
+    public static final int STORE_SCRATCH      = 27; // iArgs: [scratch_idx]
+    public static final int LOAD_SCRATCH       = 28; // iArgs: [scratch_idx]
+
     // ── Sentinel ─────────────────────────────────────────────────────────────
     public static final int HALT               = 255;
 }

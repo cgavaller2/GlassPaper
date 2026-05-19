@@ -19,7 +19,20 @@ public final class GpuKernelHolder {
 
     public static void set(GpuNoiseKernel kernel) { instance = kernel; }
     public static GpuNoiseKernel get()            { return instance; }
-    public static boolean isAvailable()           { return instance != null; }
+
+    // Runtime kill switch — when true, fillSliceGpu acts as if GPU is
+    // unavailable and runs everything on CPU. Useful for A/B perf measurement.
+    // Initialized from -Dglasspaper.gpu.disable=true at JVM startup so
+    // pregeneration runs can compare GPU vs CPU without rebuilds.
+    private static volatile boolean disabled =
+        Boolean.getBoolean("glasspaper.gpu.disable");
+
+    public static boolean isDisabled() { return disabled; }
+    public static void    setDisabled(boolean d) { disabled = d; }
+
+    public static boolean isAvailable() {
+        return instance != null && !disabled;
+    }
 
     /**
      * Compile the density function and return pre-uploaded GPU buffers.

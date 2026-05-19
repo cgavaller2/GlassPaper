@@ -142,6 +142,10 @@ public final class GlassPaperBenchmark {
                     case io.papermc.paper.gpu.DfOpcode.WEIRD_SCALED_SAMPLER:
                         sb.append(String.format("WEIRD_SCALED_SAMPLER idx=%d mapper=%d",
                             cdf.iOps[ip++], cdf.iOps[ip++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.STORE_SCRATCH:
+                        sb.append(String.format("STORE_SCRATCH idx=%d", cdf.iOps[ip++])); break;
+                    case io.papermc.paper.gpu.DfOpcode.LOAD_SCRATCH:
+                        sb.append(String.format("LOAD_SCRATCH idx=%d", cdf.iOps[ip++])); break;
                     case io.papermc.paper.gpu.DfOpcode.HALT:
                         sb.append("HALT");
                         ip = cdf.iOps.length;

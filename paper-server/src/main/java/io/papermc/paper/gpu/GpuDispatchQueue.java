@@ -63,9 +63,21 @@ public final class GpuDispatchQueue {
 
     /**
      * Submit work and block until the GPU result is ready.
-     * Called from Paper worker threads.
+     * Convenience wrapper around {@link #submitAsync} + {@link #awaitResult}.
      */
     public double[] submit(double[] positions, GpuCompiledKernel gpuKernel, int count) {
+        return awaitResult(submitAsync(positions, gpuKernel, count));
+    }
+
+    /**
+     * Submit work without blocking. Returns the work item; the caller is
+     * responsible for awaiting its future via {@link #awaitResult}.
+     *
+     * Use this to enqueue multiple submissions (e.g. all interpolators of a
+     * slice fill) before any blocking, so the flusher sees more points per
+     * batch and can coalesce them into a single GPU dispatch.
+     */
+    public GpuWorkItem submitAsync(double[] positions, GpuCompiledKernel gpuKernel, int count) {
         GpuWorkItem item = new GpuWorkItem(positions, gpuKernel, count);
         pendingQueue.add(item);
         int total = pendingPoints.addAndGet(count);
@@ -76,12 +88,15 @@ public final class GpuDispatchQueue {
                 flusherThread.notifyAll();
             }
         }
+        return item;
+    }
 
-        // Block until flusher completes this item. Returns null for:
-        //   - real timeout (GPU overloaded)
-        //   - flusher caught a dispatch exception (completed with null)
-        //   - shutdown drained this item
-        // In every null case the caller must fall back to CPU.
+    /**
+     * Block until the work item completes. Returns null on timeout, on
+     * dispatch exception (flusher completes with null), or on shutdown.
+     * In every null case the caller must fall back to CPU.
+     */
+    public double[] awaitResult(GpuWorkItem item) {
         try {
             return item.future.get(50, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
@@ -162,7 +177,12 @@ public final class GpuDispatchQueue {
             byKernel.computeIfAbsent(w.gpuKernel, k -> new ArrayList<>()).add(w);
         }
 
-        // ── 3. One GPU dispatch per kernel group ──────────────────────────────
+        // ── 3. One blocking GPU dispatch per kernel group ───────────────────
+        // Pipelining experiments (async enqueue, OOO queue, clFinish-at-end)
+        // failed in practice on NVIDIA + JOCL — either events hang or all
+        // dispatches time out. Stick with the simple per-group blocking
+        // dispatch; the meaningful coalescing happens at the queue layer
+        // (work items for the same kernel merge into one big position array).
         for (Map.Entry<GpuCompiledKernel, List<GpuWorkItem>> entry : byKernel.entrySet()) {
             GpuCompiledKernel ck    = entry.getKey();
             List<GpuWorkItem> group = entry.getValue();
@@ -186,6 +206,7 @@ public final class GpuDispatchQueue {
                 long start = System.nanoTime();
                 mergedResults = kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints);
                 GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
+                GlassPaperBenchmark.recordBatchFlush(totalPoints);
             } catch (Exception e) {
                 LOGGER.warning("GPU batch dispatch failed: " + e.getMessage());
                 // Signal CPU fallback to each waiting worker. Zero-filling the

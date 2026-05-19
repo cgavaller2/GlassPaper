@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Tue, 19 May 2026 10:20:47 -0500
+Subject: [PATCH] GlassPaper: Phase 9.3 scratch CSE + async submit + GPU
+ disable toggle
+
+
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index 6db614169ddf887a885e4df14a3193851b713662..fa6530afb9b1a1132cbab529da1c0623f5433fc6 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -619,6 +619,18 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             return;
+         }
+ 
++        if (msg.equalsIgnoreCase("gpudisable") || msg.equalsIgnoreCase("gpuenable")) {
++            boolean disable = msg.equalsIgnoreCase("gpudisable");
++            io.papermc.paper.gpu.GpuKernelHolder.setDisabled(disable);
++            if (disable) {
++                LOGGER.info("GPU acceleration DISABLED. All density functions now run on CPU.");
++                LOGGER.info("Pregenerate fresh terrain to measure CPU-only throughput.");
++            } else {
++                LOGGER.info("GPU acceleration ENABLED.");
++            }
++            return;
++        }
++
+         // Paper end - rewrite chunk system
+         this.serverCommandQueue.add(new ConsoleInput(msg, source)); // Paper - Perf: use proper queue
+     }
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+index 8e76725ab5871442679dee6d54d7d8d2ee894c5e..80194ce7827289df5229ed75ad62d7db1e677e01 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -117,9 +117,50 @@ public final class DensityFunctionCompiler {
+     private static final java.util.Set<String> loggedFailures =
+         java.util.concurrent.ConcurrentHashMap.newKeySet();
+ 
++    // ── Scratch-register dedup (GPU equivalent of NoiseChunk.CacheOnce) ──────
++    // First pass walks the tree counting references to cacheable instances
++    // (NoiseChunk.NoiseInterpolator / CacheOnce / CacheAllInCell / FlatCache /
++    // Cache2D — all dedup'd to one instance per logical node by NoiseChunk.wrap).
++    // Instances referenced ≥ 2 times get a scratch slot; second pass emits the
++    // inner tree once + STORE_SCRATCH, replacing later references with LOAD_SCRATCH.
++    private static final int SCRATCH_CAPACITY = 32;
++    private boolean countingPhase = false;
++    private final IdentityHashMap<DensityFunction, int[]>    refCounts     = new IdentityHashMap<>();
++    private final IdentityHashMap<DensityFunction, Integer>  scratchSlots  = new IdentityHashMap<>();
++    private final IdentityHashMap<DensityFunction, Boolean>  scratchEmitted = new IdentityHashMap<>();
++
++    /**
++     * Density-function types eligible for scratch-slot common-subexpression
++     * elimination. The cache-marker types (CacheOnce, CacheAllInCell, FlatCache,
++     * Cache2D) are vanilla's own caching markers — Mojang already groups
++     * subexpressions worth caching under these, and dedup'ing them on GPU
++     * matches the CPU semantics one-for-one.
++     *
++     * NoiseInterpolator is deliberately excluded. Bisection showed that
++     * dedup'ing NoiseInterpolator instances produces ~4.8% BlendDensity
++     * mismatches with max delta ~5.0 vs ~0.003% / max 0.09 with cache markers
++     * alone. Root cause not yet identified; suspect interaction with how
++     * NoiseInterpolator's noiseFiller propagates through nested sub-trees
++     * (NI's wrapped() is shared across multiple traversal paths in vanilla
++     * MC's noise router in a way that the simple identity-keyed ref-count
++     * doesn't capture correctly). Revisit if perf demands it.
++     */
++    private static boolean isCacheable(DensityFunction fn) {
++        if (fn instanceof NoiseChunk.NoiseChunkDensityFunction) {
++            String cls = fn.getClass().getSimpleName();
++            return cls.equals("CacheOnce") || cls.equals("CacheAllInCell")
++                || cls.equals("FlatCache") || cls.equals("Cache2D");
++        }
++        return false;
++    }
++
+     public static CompiledDensityFunction compile(DensityFunction fn) {
+         DensityFunctionCompiler c = new DensityFunctionCompiler();
++
++        // Pass 1: count identity references to cacheable nodes.
++        c.countingPhase = true;
+         c.emit(fn);
++        c.countingPhase = false;
+         if (c.failed) {
+             if (loggedFailures.add(c.failReason)) {
+                 LOGGER.warning("DensityFunctionCompiler failed: " + c.failReason
+@@ -127,6 +168,42 @@ public final class DensityFunctionCompiler {
+             }
+             return null;
+         }
++
++        // Allocate scratch slots for nodes referenced ≥ 2 times.
++        // Nodes that overflow SCRATCH_CAPACITY simply don't get dedup'd —
++        // they re-emit their inner tree on each reference, same as before.
++        int nextSlot = 0;
++        for (java.util.Map.Entry<DensityFunction, int[]> e : c.refCounts.entrySet()) {
++            if (e.getValue()[0] >= 2 && nextSlot < SCRATCH_CAPACITY) {
++                c.scratchSlots.put(e.getKey(), nextSlot++);
++            }
++        }
++
++        // Reset state accumulated during the counting pass; pass 2 produces
++        // the real bytecode and buffers.
++        c.iOps.clear();
++        c.dArgs.clear();
++        c.noiseIndex.clear();
++        c.noiseParamsEntries.clear();
++        c.noiseInfoEntries.clear();
++        c.octaveParamsEntries.clear();
++        c.permTableEntries.clear();
++        c.blendedScalarsEntries.clear();
++        c.blendedPerlinFactorsEntries.clear();
++        c.blendedPerlinInfoEntries.clear();
++        c.blendedIndex.clear();
++        c.splineHeaders.clear();
++        c.splineFloatPool.clear();
++        c.splineChildren.clear();
++
++        // Pass 2: emit with dedup.
++        c.emit(fn);
++        if (c.failed) {
++            if (loggedFailures.add(c.failReason)) {
++                LOGGER.warning("DensityFunctionCompiler failed during emit phase: " + c.failReason);
++            }
++            return null;
++        }
+         c.iOps.add(DfOpcode.HALT);
+         return c.build();
+     }
+@@ -136,6 +213,37 @@ public final class DensityFunctionCompiler {
+     private void emit(DensityFunction fn) {
+         if (failed) return;
+ 
++        if (countingPhase) {
++            if (isCacheable(fn)) {
++                int[] count = refCounts.computeIfAbsent(fn, k -> new int[1]);
++                count[0]++;
++                if (count[0] > 1) return;  // inner subtree already counted on first visit
++            }
++            emitInternal(fn);
++            return;
++        }
++
++        Integer slot = scratchSlots.get(fn);
++        if (slot != null) {
++            if (scratchEmitted.containsKey(fn)) {
++                iOps.add(DfOpcode.LOAD_SCRATCH);
++                iOps.add(slot);
++                return;
++            }
++            scratchEmitted.put(fn, Boolean.TRUE);
++            emitInternal(fn);
++            if (failed) return;
++            iOps.add(DfOpcode.STORE_SCRATCH);
++            iOps.add(slot);
++            return;
++        }
++
++        emitInternal(fn);
++    }
++
++    private void emitInternal(DensityFunction fn) {
++        if (failed) return;
++
+         // ── Unwrap NoiseChunk cache types (safe at cell corners) ──────────────
+         if (fn instanceof NoiseChunk.NoiseInterpolator ni) { emit(ni.wrapped()); return; }
+         if (fn instanceof DensityFunctions.MarkerOrMarked m) { emit(m.wrapped()); return; }
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index 7d3acb0ca2131f25c789088f5867fcfc2e0a4315..e718a2942880ee8a29e9d4c58448ccb6a107f369 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -322,18 +322,35 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+             return;
+         }
+ 
+-        // Dispatch each GPU-capable interpolator, CPU fallback for the rest
++        // Submit ALL GPU-eligible interpolators upfront, then await results in
++        // a second pass. This puts every interpolator's work onto the dispatch
++        // queue simultaneously instead of serializing one-blocking-submit per
++        // interpolator, which gives the flusher much more material to coalesce
++        // and tips per-dispatch overhead from being the bottleneck.
++        io.papermc.paper.gpu.GpuDispatchQueue queue =
++            io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue();
++        io.papermc.paper.gpu.GpuWorkItem[] pending =
++            new io.papermc.paper.gpu.GpuWorkItem[this.interpolators.size()];
++
++        // Pass A: enqueue everything.
++        if (queue != null) {
++            for (int i = 0; i < this.interpolators.size(); i++) {
++                io.papermc.paper.gpu.GpuCompiledKernel ck = compiledKernels[i];
++                if (ck != null && gpuKernel != null) {
++                    pending[i] = queue.submitAsync(positions, ck, pointsPerInterp);
++                }
++            }
++        }
++
++        // Pass B: collect results / fall back to CPU per interpolator.
+         for (int i = 0; i < this.interpolators.size(); i++) {
+             NoiseChunk.NoiseInterpolator interp = this.interpolators.get(i);
+             io.papermc.paper.gpu.GpuCompiledKernel ck = compiledKernels[i];
+ 
+             if (ck != null && gpuKernel != null) {
+-                io.papermc.paper.gpu.GpuDispatchQueue queue =
+-                    io.papermc.paper.gpu.GpuKernelHolder.getDispatchQueue();
+-
+                 double[] results;
+                 if (queue != null) {
+-                    results = queue.submit(positions, ck, pointsPerInterp);
++                    results = queue.awaitResult(pending[i]);
+                 } else {
+                     long gpuStart = System.nanoTime();
+                     results = gpuKernel.evalDensityTreeFast(positions, ck, pointsPerInterp);
+@@ -341,7 +358,6 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+                         System.nanoTime() - gpuStart, pointsPerInterp);
+                 }
+ 
+-
+                 if (results != null) {
+                     for (int zi = 0; zi < zColumns; zi++) {
+                         double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];

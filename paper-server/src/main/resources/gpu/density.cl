@@ -450,11 +450,15 @@ static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
 
 #define STACK_SIZE 64
 #define MAX_ITERS 4096
+#define SCRATCH_SIZE 32
 
 #define OP_SHIFT_B_NOISE     24
 #define OP_BLENDED_NOISE     25
 
 #define OP_WEIRD_SCALED_SAMPLER 26
+
+#define OP_STORE_SCRATCH     27
+#define OP_LOAD_SCRATCH      28
 
 // ═══════════════════════════════════════════════════════════════════
 //  SECTION 4 — Kernels
@@ -485,6 +489,7 @@ __kernel void evalDensityTree(
     double z = positions[id*3+2];
 
     double stack[STACK_SIZE];
+    double scratch[SCRATCH_SIZE];
     int sp = 0, ip = 0, dp = 0;
 
     for (int iter = 0; iter < MAX_ITERS; iter++) {
@@ -589,6 +594,19 @@ __kernel void evalDensityTree(
         case OP_BLEND_DENSITY_NOOP:
             // identity: wrapped function result is already on stack
             break;
+
+        case OP_STORE_SCRATCH: {
+            int idx = iOps[ip++];
+            // Peek-and-store: leave the value on the stack for the caller.
+            scratch[idx] = stack[sp - 1];
+            break;
+        }
+
+        case OP_LOAD_SCRATCH: {
+            int idx = iOps[ip++];
+            stack[sp++] = scratch[idx];
+            break;
+        }
 
         case OP_SPLINE_EVAL: {
             int si    = iOps[ip++];
