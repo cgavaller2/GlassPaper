@@ -124,7 +124,6 @@ public final class GpuKernelHolder {
     private static boolean fitsConstant(CompiledDensityFunction cdf, long limit) {
         return fits("noiseParams",          cdf.noiseParams.length * 8L,          limit)
             && fits("noiseInfo",            cdf.noiseInfo.length * 4L,            limit)
-            && fits("octaveParams",         cdf.octaveParams.length * 8L,         limit)
             && fits("splineHeaders",        cdf.splineHeaders.length * 4L,        limit)
             && fits("blendedScalars",       cdf.blendedScalars.length * 8L,       limit)
             && fits("blendedPerlinFactors", cdf.blendedPerlinFactors.length * 8L, limit)
