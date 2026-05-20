@@ -64,9 +64,13 @@ static double improvedNoise(double x, double y, double z,
     double fx=dx-gx, fy=dy-gy, fz=dz-gz;
     return sampleAndLerp(gx,gy,gz, fx,fy,fz,fy, p);
 }
+// Phase 9.6.G: octP is __constant (hot inner-loop read — every active octave
+// reads 4 doubles per work-item, all at the same address per WG). Cascades
+// to evalNoise's caller. permTables stays __global (256 B × N octaves, ~50 KB
+// for vanilla overworld — well over the 64 KB constant window).
 static double perlinGetValue(double x, double y, double z,
                               double inputF, double valueF, int nOct, int octBase,
-                              __global const double* octP,
+                              __constant double* octP,
                               __global const uchar*  perms) {
     double result=0.0, is=inputF, vs=valueF;
     for (int i=0; i<nOct; i++) {
@@ -81,15 +85,14 @@ static double perlinGetValue(double x, double y, double z,
     }
     return result;
 }
-// Phase 9.6.E: noiseParams + noiseInfo are __constant (small, hit on every
-// noise op by every work-item — ideal for hardware constant-cache broadcast).
-// octaveParams + permTables remain __global: octaveParams can grow with
-// total octave count, permTables is 256B × N octaves (often > 8KB) — neither
-// is safe to assume fits the OpenCL-spec-minimum 64KB constant window.
+// Phase 9.6.E/G: noiseParams + noiseInfo + octaveParams are __constant.
+// permTables stays __global: 256 B × N octaves, ~50 KB on vanilla overworld —
+// regularly exceeds the 64 KB constant window. octaveParams (~6 KB vanilla)
+// is size-checked at upload in GpuKernelHolder.fitsConstant.
 static double evalNoise(int ni, double x, double y, double z,
                          __constant double* noiseParams,
                          __constant int*    noiseInfo,
-                         __global const double* octaveParams,
+                         __constant double* octaveParams,
                          __global const uchar*  permTables) {
     int pb=ni*5, ib=ni*4;
     double vf=noiseParams[pb], fiF=noiseParams[pb+1], fvF=noiseParams[pb+2],
@@ -135,7 +138,7 @@ static double perlinGetValueYScale(
     double yScale, double yMax,
     double inputF, double valueF,
     int nOct, int octBase,
-    __global const double* octP,
+    __constant double* octP,
     __global const uchar*  perms)
 {
     double result = 0.0;
@@ -162,14 +165,14 @@ static double perlinGetValueYScale(
 // blendedScalars:       5 doubles per instance [xzMul, yMul, xzFac, yFac, smear]
 // blendedPerlinFactors: 6 doubles per instance [minIF, minVF, maxIF, maxVF, mainIF, mainVF]
 // blendedPerlinInfo:    6 ints per instance    [minOff, maxOff, mainOff, minCnt, maxCnt, mainCnt]
-// Phase 9.6.E: blended* scalars/factors/info are __constant. Small (≤ a
-// handful of BlendedNoise instances × 5-6 ints/doubles each).
+// Phase 9.6.E/G: blended* scalars/factors/info are __constant. octaveParams
+// also __constant (cascaded from perlinGetValueYScale).
 static double evalBlendedNoise(
     int bi, double x, double y, double z,
     __constant double* blendedScalars,
     __constant double* blendedPerlinFactors,
     __constant int*    blendedPerlinInfo,
-    __global const double* octaveParams,
+    __constant double* octaveParams,
     __global const uchar*  permTables)
 {
     int sb = bi * 5;
@@ -493,7 +496,7 @@ __kernel void evalDensityTree(
     __global   const double* dArgs,
     __constant       double* noiseParams,
     __constant       int*    noiseInfo,
-    __global   const double* octaveParams,
+    __constant       double* octaveParams,
     __global   const uchar*  permTables,
     __constant       int*    splineHeaders,
     __global   const float*  splineFloatPool,
@@ -670,9 +673,12 @@ __kernel void sampleNoise(
 
 // ── NormalNoise batch kernel (kept for validation) ────────────────────────────
 #define NORMAL_NOISE_INPUT_FACTOR 1.0181268882175227
+// Phase 9.6.G: octP cascaded to __constant to keep perlinGetValue's
+// signature single. Validator data is small (test sample only) so the
+// constant window is never a concern here.
 __kernel void sampleNormalNoise(
     __global const double* positions, __global const double* noiseP,
-    __global const double* octP, __global const uchar* perms,
+    __constant double* octP, __global const uchar* perms,
     __global double* output, int firstN, int secondN, int count)
 {
     int id = get_global_id(0); if (id >= count) return;
