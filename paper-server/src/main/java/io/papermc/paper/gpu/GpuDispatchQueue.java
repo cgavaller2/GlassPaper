@@ -251,6 +251,13 @@ public final class GpuDispatchQueue {
      * a DensitySlot internally), and routes results back to each work item's
      * future. On failure, completes each future with null so the calling
      * worker can fall back to CPU evaluation.
+     *
+     * Per-thread reusable result buffer (Phase 9.6.C): each dispatcher
+     * thread keeps a single growable double[] for the merged GPU output,
+     * eliminating one allocation per dispatch group. Per-item slices for
+     * each work item are still allocated because they outlive this method
+     * (the consumer reads them after future.complete) — those are a
+     * separate, deeper change.
      */
     private void dispatchGroup(GpuCompiledKernel ck, List<GpuWorkItem> group) {
         // Build merged position array
@@ -266,11 +273,12 @@ public final class GpuDispatchQueue {
                 mergedPositions, w.batchOffset * 3, w.count * 3);
         }
 
+        double[] mergedResults = acquireResultBuf(totalPoints);
+
         // Single GPU dispatch for the whole group
-        double[] mergedResults;
         try {
             long start = System.nanoTime();
-            mergedResults = kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints);
+            kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints, mergedResults);
             GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
             GlassPaperBenchmark.recordBatchFlush(totalPoints);
         } catch (Exception e) {
@@ -285,11 +293,31 @@ public final class GpuDispatchQueue {
             return;
         }
 
-        // Split results back to individual futures
+        // Split results back to individual futures. Per-item slices are
+        // freshly allocated because the merged buffer is about to be
+        // overwritten by this thread's next dispatch — handing it out
+        // would race the consumer's read against the next kernel run.
         for (GpuWorkItem w : group) {
             double[] slice = new double[w.count];
             System.arraycopy(mergedResults, w.batchOffset, slice, 0, w.count);
             w.future.complete(slice);
         }
+    }
+
+    // Per-dispatch-thread reusable result buffer. Sized to the largest
+    // group seen on this thread so far. Stored as a 1-element double[][]
+    // so we can grow it without allocating a new ThreadLocal entry.
+    private static final ThreadLocal<double[]> RESULT_BUF =
+        ThreadLocal.withInitial(() -> new double[0]);
+
+    private static double[] acquireResultBuf(int needed) {
+        double[] buf = RESULT_BUF.get();
+        if (buf.length < needed) {
+            // Grow with headroom so small fluctuations don't churn.
+            int grown = Math.max(needed, buf.length * 2);
+            buf = new double[grown];
+            RESULT_BUF.set(buf);
+        }
+        return buf;
     }
 }

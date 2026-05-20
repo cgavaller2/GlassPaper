@@ -233,15 +233,43 @@ public final class GpuNoiseKernel {
 
     // ── evalDensityTreeFast (main chunk gen path) ─────────────────────────────
 
+    /**
+     * Dispatch density-tree evaluation. Writes the first {@code count}
+     * doubles into {@code outResults} (must be at least {@code count} long).
+     *
+     * The caller-supplied output buffer is the perf-relevant change in
+     * Phase 9.6.C: GpuDispatchQueue.dispatchGroup runs on a fixed-size pool
+     * of dispatcher threads, so passing in a thread-local buffer eliminates
+     * the per-call `new double[count]` that previously fronted every
+     * dispatch. With ~157 ch/s × ~5× overlap × ~825 points × 8 B that was
+     * ~5 MB/s of allocator churn on dispatch threads.
+     */
+    public void evalDensityTreeFast(double[] positions,
+                                    GpuCompiledKernel gpuKernel,
+                                    int count,
+                                    double[] outResults) {
+        if (outResults.length < count) {
+            throw new IllegalArgumentException(
+                "outResults too small: " + outResults.length + " < " + count);
+        }
+        if (count > MAX_POOLED_POINTS) {
+            evalDensityTreeUnpooled(positions, gpuKernel, count, outResults);
+        } else {
+            evalDensityTreePooled(positions, gpuKernel, count, outResults);
+        }
+    }
+
+    /**
+     * Allocating overload — retained so the dispatchQueue==null fallback
+     * in NoiseChunk.fillSliceGpu (and any other synchronous caller) stays
+     * unchanged. The hot path uses the output-array form above.
+     */
     public double[] evalDensityTreeFast(double[] positions,
                                         GpuCompiledKernel gpuKernel,
                                         int count) {
-        // Oversized batches go down the slow path with per-call alloc — we
-        // simply can't reuse the pooled buffer if the request doesn't fit.
-        if (count > MAX_POOLED_POINTS) {
-            return evalDensityTreeUnpooled(positions, gpuKernel, count);
-        }
-        return evalDensityTreePooled(positions, gpuKernel, count);
+        double[] results = new double[count];
+        evalDensityTreeFast(positions, gpuKernel, count, results);
+        return results;
     }
 
     /**
@@ -250,9 +278,10 @@ public final class GpuNoiseKernel {
      * blocking-reads the results. Slot buffers are sized for MAX_POOLED_POINTS
      * and reused indefinitely — no cl_mem alloc/release in this path.
      */
-    private double[] evalDensityTreePooled(double[] positions,
-                                           GpuCompiledKernel gpuKernel,
-                                           int count) {
+    private void evalDensityTreePooled(double[] positions,
+                                       GpuCompiledKernel gpuKernel,
+                                       int count,
+                                       double[] outResults) {
         DensitySlot slot = borrowSlot();
         try {
             cl_kernel        k      = slot.kernel;
@@ -288,7 +317,7 @@ public final class GpuNoiseKernel {
             // BlendedNoise path, so `gpuvalidate` may produce false-positive
             // mismatch reports under load. Terrain itself is correct —
             // verified visually.
-            double[] results = new double[count];
+            //
             // Blocking write — Java GC could otherwise relocate `positions`
             // between this call and the kernel reading from it.
             clEnqueueWriteBuffer(q, posBuf, CL_TRUE, 0,
@@ -298,8 +327,7 @@ public final class GpuNoiseKernel {
                 new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
             clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count,
-                Pointer.to(results), 0, null, null);
-            return results;
+                Pointer.to(outResults), 0, null, null);
         } finally {
             returnSlot(slot);
         }
@@ -309,9 +337,10 @@ public final class GpuNoiseKernel {
      * Cold path. Allocates fresh cl_mem buffers per call — used only when the
      * request exceeds MAX_POOLED_POINTS. This is the pre-Phase-9.4 behavior.
      */
-    private double[] evalDensityTreeUnpooled(double[] positions,
-                                             GpuCompiledKernel gpuKernel,
-                                             int count) {
+    private void evalDensityTreeUnpooled(double[] positions,
+                                         GpuCompiledKernel gpuKernel,
+                                         int count,
+                                         double[] outResults) {
         DensitySlot slot = borrowSlot();
         try {
             cl_kernel        k = slot.kernel;
@@ -341,15 +370,13 @@ public final class GpuNoiseKernel {
             clSetKernelArg(k, 13, Sizeof.cl_mem, Pointer.to(outBuf));
             clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
-            double[] results = new double[count];
             clEnqueueNDRangeKernel(q, k, 1, null,
                 new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
             clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
-                (long) Sizeof.cl_double * count, Pointer.to(results), 0, null, null);
+                (long) Sizeof.cl_double * count, Pointer.to(outResults), 0, null, null);
 
             clReleaseMemObject(posBuf);
             clReleaseMemObject(outBuf);
-            return results;
         } finally {
             returnSlot(slot);
         }
