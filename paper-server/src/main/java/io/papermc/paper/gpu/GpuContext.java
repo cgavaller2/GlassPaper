@@ -30,13 +30,23 @@ public final class GpuContext {
     private final cl_command_queue  queue;            // validator queue (cold path)
     private final cl_command_queue[] densityQueues;   // hot-path, one per slot
 
+    // Phase 9.6.E — cached at init, consulted on every getOrUpload to refuse
+    // density trees whose to-be-__constant buffers exceed the device's limit.
+    // OpenCL 1.2 spec minimum is 64 KB; NVIDIA/AMD/Intel all report ≥ 64 KB
+    // in practice, but we never assume.
+    private final long maxConstantBufferSize;
+
     private GpuContext(cl_device_id device, cl_context context,
-                       cl_command_queue queue, cl_command_queue[] densityQueues) {
+                       cl_command_queue queue, cl_command_queue[] densityQueues,
+                       long maxConstantBufferSize) {
         this.device         = device;
         this.context        = context;
         this.queue          = queue;
         this.densityQueues  = densityQueues;
+        this.maxConstantBufferSize = maxConstantBufferSize;
     }
+
+    public long maxConstantBufferSize() { return maxConstantBufferSize; }
 
     public static synchronized GpuContext init() {
         if (INSTANCE != null) return INSTANCE;
@@ -97,8 +107,29 @@ public final class GpuContext {
         LOGGER.info("Created " + DENSITY_QUEUE_COUNT
             + " density command queues for per-slot parallel dispatch.");
 
-        INSTANCE = new GpuContext(chosenDevice, ctx, queue, densityQueues);
+        // Vendor-portable capability log. Phase 9.6.E uses __constant for
+        // small hot buffers; per-tree size check refuses oversized trees.
+        long maxConst = queryUlong(chosenDevice, CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE);
+        long maxConstArgs = queryUint(chosenDevice, CL_DEVICE_MAX_CONSTANT_ARGS);
+        long maxWg   = queryUlong(chosenDevice, CL_DEVICE_MAX_WORK_GROUP_SIZE);
+        LOGGER.info(String.format(
+            "Device capabilities: max constant buffer = %.1f KB, "
+          + "max constant args = %d, max work-group size = %d",
+            maxConst / 1024.0, maxConstArgs, maxWg));
+
+        INSTANCE = new GpuContext(chosenDevice, ctx, queue, densityQueues, maxConst);
         return INSTANCE;
+    }
+
+    private static long queryUlong(cl_device_id device, int param) {
+        long[] out = new long[1];
+        clGetDeviceInfo(device, param, Sizeof.cl_ulong, Pointer.to(out), null);
+        return out[0];
+    }
+    private static long queryUint(cl_device_id device, int param) {
+        int[] out = new int[1];
+        clGetDeviceInfo(device, param, Sizeof.cl_uint, Pointer.to(out), null);
+        return out[0] & 0xFFFFFFFFL;
     }
 
     public cl_context       context() { return context; }

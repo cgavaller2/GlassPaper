@@ -84,12 +84,25 @@ public final class GpuKernelHolder {
             return null;
         }
 
+        // Phase 9.6.E: the six small hot buffers are bound to __constant
+        // kernel params. If any one of them exceeds the device's
+        // CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE for this tree, the dispatch
+        // would fail at runtime — refuse upload here so the caller falls
+        // back to CPU gracefully. Spec minimum is 64 KB; vanilla MC's
+        // noise router stays well under that in practice, but bespoke /
+        // modded routers could blow it up.
+        GpuContext ctx = GpuContext.get();
+        if (ctx != null && !fitsConstant(cdf, ctx.maxConstantBufferSize())) {
+            identityCache.put(fn, NEGATIVE);
+            GlassPaperBenchmark.recordCompileMiss(System.nanoTime() - compileStart);
+            return null;
+        }
+
         // 2. Key by content — identical programs share one GPU buffer set.
         DfCacheKey key = DfCacheKey.of(cdf);
         final boolean[] wasHit = { true };
         GpuCompiledKernel result = gpuKernelCache.computeIfAbsent(key, k -> {
             wasHit[0] = false;
-            GpuContext ctx = GpuContext.get();
             if (ctx == null) return null;
             return GpuCompiledKernel.upload(ctx, cdf);
         });
@@ -106,6 +119,31 @@ public final class GpuKernelHolder {
             identityCache.put(fn, NEGATIVE);
         }
         return result;
+    }
+
+    private static boolean fitsConstant(CompiledDensityFunction cdf, long limit) {
+        return fits("noiseParams",          cdf.noiseParams.length * 8L,          limit)
+            && fits("noiseInfo",            cdf.noiseInfo.length * 4L,            limit)
+            && fits("splineHeaders",        cdf.splineHeaders.length * 4L,        limit)
+            && fits("blendedScalars",       cdf.blendedScalars.length * 8L,       limit)
+            && fits("blendedPerlinFactors", cdf.blendedPerlinFactors.length * 8L, limit)
+            && fits("blendedPerlinInfo",    cdf.blendedPerlinInfo.length * 4L,    limit);
+    }
+
+    private static final java.util.Set<String> warnedOversize =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Returns true if the buffer fits the device's __constant limit. */
+    private static boolean fits(String name, long bytes, long limit) {
+        if (bytes <= limit) return true;
+        if (warnedOversize.add(name)) {
+            java.util.logging.Logger.getLogger("GlassPaper").warning(String.format(
+                "Density tree %s buffer (%d bytes) exceeds device __constant "
+              + "limit (%d bytes); falling back to CPU. Further occurrences "
+              + "will be suppressed.",
+                name, bytes, limit));
+        }
+        return false;
     }
 
     public static void releaseAll() {

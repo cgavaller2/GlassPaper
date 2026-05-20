@@ -81,9 +81,14 @@ static double perlinGetValue(double x, double y, double z,
     }
     return result;
 }
+// Phase 9.6.E: noiseParams + noiseInfo are __constant (small, hit on every
+// noise op by every work-item — ideal for hardware constant-cache broadcast).
+// octaveParams + permTables remain __global: octaveParams can grow with
+// total octave count, permTables is 256B × N octaves (often > 8KB) — neither
+// is safe to assume fits the OpenCL-spec-minimum 64KB constant window.
 static double evalNoise(int ni, double x, double y, double z,
-                         __global const double* noiseParams,
-                         __global const int*    noiseInfo,
+                         __constant double* noiseParams,
+                         __constant int*    noiseInfo,
                          __global const double* octaveParams,
                          __global const uchar*  permTables) {
     int pb=ni*5, ib=ni*4;
@@ -157,11 +162,13 @@ static double perlinGetValueYScale(
 // blendedScalars:       5 doubles per instance [xzMul, yMul, xzFac, yFac, smear]
 // blendedPerlinFactors: 6 doubles per instance [minIF, minVF, maxIF, maxVF, mainIF, mainVF]
 // blendedPerlinInfo:    6 ints per instance    [minOff, maxOff, mainOff, minCnt, maxCnt, mainCnt]
+// Phase 9.6.E: blended* scalars/factors/info are __constant. Small (≤ a
+// handful of BlendedNoise instances × 5-6 ints/doubles each).
 static double evalBlendedNoise(
     int bi, double x, double y, double z,
-    __global const double* blendedScalars,
-    __global const double* blendedPerlinFactors,
-    __global const int*    blendedPerlinInfo,
+    __constant double* blendedScalars,
+    __constant double* blendedPerlinFactors,
+    __constant int*    blendedPerlinInfo,
     __global const double* octaveParams,
     __global const uchar*  permTables)
 {
@@ -304,18 +311,21 @@ static int findKnot(float coord, int K, int fpStart, __global const float* fp) {
     return lo - 1;
 }
 
+// Phase 9.6.E: splineHeaders is __constant (small — 16B per spline; even
+// the overworld noise router has ≤ ~100 splines → ~1.6KB). floatPool and
+// childIndices remain __global; floatPool can grow with knot count.
 // Forward declarations for depth-limited recursion
 static float evalSplineD0(int idx, float c0,
-    __global const int* sh, __global const float* fp, __global const int* ci);
+    __constant int* sh, __global const float* fp, __global const int* ci);
 static float evalSplineD1(int idx, float c0, float c1,
-    __global const int* sh, __global const float* fp, __global const int* ci);
+    __constant int* sh, __global const float* fp, __global const int* ci);
 static float evalSplineD2(int idx, float c0, float c1, float c2,
-    __global const int* sh, __global const float* fp, __global const int* ci);
+    __constant int* sh, __global const float* fp, __global const int* ci);
 static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
-    __global const int* sh, __global const float* fp, __global const int* ci);
+    __constant int* sh, __global const float* fp, __global const int* ci);
 
 static float evalSplineD0(int idx, float c0,
-    __global const int* sh, __global const float* fp, __global const int* ci)
+    __constant int* sh, __global const float* fp, __global const int* ci)
 {
     int b = idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
     if (type == 0) return fp[fpS];  // constant
@@ -330,7 +340,7 @@ static float evalSplineD0(int idx, float c0,
 }
 
 static float evalSplineD1(int idx, float c0, float c1,
-    __global const int* sh, __global const float* fp, __global const int* ci)
+    __constant int* sh, __global const float* fp, __global const int* ci)
 {
     int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
     if (type == 0) return fp[fpS];
@@ -359,7 +369,7 @@ static float evalSplineD1(int idx, float c0, float c1,
 }
 
 static float evalSplineD2(int idx, float c0, float c1, float c2,
-    __global const int* sh, __global const float* fp, __global const int* ci)
+    __constant int* sh, __global const float* fp, __global const int* ci)
 {
     int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
     if (type == 0) return fp[fpS];
@@ -391,7 +401,7 @@ static float evalSplineD2(int idx, float c0, float c1, float c2,
 // deepest coordinate, producing wrong terrain shape that propagated through
 // the final density tree as BlendDensity divergence.
 static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
-    __global const int* sh, __global const float* fp, __global const int* ci)
+    __constant int* sh, __global const float* fp, __global const int* ci)
 {
     int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
     if (type == 0) return fp[fpS];
@@ -464,21 +474,34 @@ static float evalSplineD3(int idx, float c0, float c1, float c2, float c3,
 //  SECTION 4 — Kernels
 // ═══════════════════════════════════════════════════════════════════
 
+// Phase 9.6.E address-space layout:
+//   __constant  — small, hit by every work-item on the same address per op.
+//                 Routes through the device's constant cache on every vendor
+//                 with one (NVIDIA constant cache, AMD scalar cache, Intel
+//                 constant memory). Spec minimum is 64KB total + 8 args.
+//                 We use 6 args; max combined size is small-tree dependent
+//                 but bounded by vanilla MC's noise router shape (~few KB).
+//   __global    — sized by the density tree (per-octave perm tables, the
+//                 bytecode itself, knot pools). Could exceed 64KB on
+//                 large noise routers, so kept in global.
+//
+// All __constant buffers are allocated CL_MEM_READ_ONLY in GpuCompiledKernel,
+// so the OpenCL runtime is free to materialize them in constant memory.
 __kernel void evalDensityTree(
-    __global const double* positions,
-    __global const int*    iOps,
-    __global const double* dArgs,
-    __global const double* noiseParams,
-    __global const int*    noiseInfo,
-    __global const double* octaveParams,
-    __global const uchar*  permTables,
-    __global const int*    splineHeaders,
-    __global const float*  splineFloatPool,
-    __global const int*    splineChildren,
-    __global const double* blendedScalars,
-    __global const double* blendedPerlinFactors,
-    __global const int*    blendedPerlinInfo,
-    __global       double* output,
+    __global   const double* positions,
+    __global   const int*    iOps,
+    __global   const double* dArgs,
+    __constant       double* noiseParams,
+    __constant       int*    noiseInfo,
+    __global   const double* octaveParams,
+    __global   const uchar*  permTables,
+    __constant       int*    splineHeaders,
+    __global   const float*  splineFloatPool,
+    __global   const int*    splineChildren,
+    __constant       double* blendedScalars,
+    __constant       double* blendedPerlinFactors,
+    __constant       int*    blendedPerlinInfo,
+    __global         double* output,
     int count)
 {
     int id = get_global_id(0);
