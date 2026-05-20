@@ -20,6 +20,16 @@ public final class GlassPaperBenchmark {
     private static final AtomicLong cpuCalls        = new AtomicLong();
     private static final AtomicLong cpuTotalNanos   = new AtomicLong();
 
+    // Compile-pass cost (DensityFunctionCompiler.compile + DfCacheKey.of)
+    // Runs on Paper worker threads in GpuKernelHolder.getOrUpload.
+    // Split into cache-miss (full compile + upload) and cache-hit
+    // (compile + key-lookup only). Identity-cache hits skip both.
+    private static final AtomicLong compileMissCalls = new AtomicLong();
+    private static final AtomicLong compileMissNanos = new AtomicLong();
+    private static final AtomicLong compileHitCalls  = new AtomicLong();
+    private static final AtomicLong compileHitNanos  = new AtomicLong();
+    private static final AtomicLong identityHitCalls = new AtomicLong();
+
     private static final AtomicLong batchFlushes     = new AtomicLong();
     private static final AtomicLong batchTotalPoints  = new AtomicLong();
     private static long             largestBatch      = 0;
@@ -272,6 +282,20 @@ public final class GlassPaperBenchmark {
         cpuTotalNanos.addAndGet(nanos);
     }
 
+    public static void recordCompileMiss(long nanos) {
+        compileMissCalls.incrementAndGet();
+        compileMissNanos.addAndGet(nanos);
+    }
+
+    public static void recordCompileHit(long nanos) {
+        compileHitCalls.incrementAndGet();
+        compileHitNanos.addAndGet(nanos);
+    }
+
+    public static void recordIdentityHit() {
+        identityHitCalls.incrementAndGet();
+    }
+
     public static void report() {
         long gCalls  = gpuCalls.get();
         long gNanos  = gpuTotalNanos.get();
@@ -329,6 +353,31 @@ public final class GlassPaperBenchmark {
             LOGGER.info("CPU fallbacks   : 0");
         }
 
+        long cmCalls = compileMissCalls.get(), chCalls = compileHitCalls.get();
+        long idCalls = identityHitCalls.get();
+        if (cmCalls + chCalls + idCalls > 0) {
+            long cmNanos = compileMissNanos.get(), chNanos = compileHitNanos.get();
+            long totalLookups = cmCalls + chCalls + idCalls;
+            double idPct  = (idCalls * 100.0) / totalLookups;
+            double chPct  = (chCalls * 100.0) / totalLookups;
+            double cmPct  = (cmCalls * 100.0) / totalLookups;
+            LOGGER.info("─── getOrUpload cost (worker thread) ───");
+            LOGGER.info(String.format(
+                "Identity hits   : %,d  (%.1f%%, ~0 cost)", idCalls, idPct));
+            if (chCalls > 0) {
+                LOGGER.info(String.format(
+                    "Content hits    : %,d  (%.1f%%, %.4f ms avg, %.2f ms total)",
+                    chCalls, chPct, (chNanos / (double) chCalls) / 1_000_000.0,
+                    chNanos / 1_000_000.0));
+            }
+            if (cmCalls > 0) {
+                LOGGER.info(String.format(
+                    "Compile + upload: %,d  (%.1f%%, %.4f ms avg, %.2f ms total)",
+                    cmCalls, cmPct, (cmNanos / (double) cmCalls) / 1_000_000.0,
+                    cmNanos / 1_000_000.0));
+            }
+        }
+
         LOGGER.info("════════════════════════════════════════");
 
         if (!functionTypes.isEmpty()) {
@@ -376,6 +425,11 @@ public final class GlassPaperBenchmark {
         cpuTotalNanos.set(0);
         batchFlushes.set(0);
         batchTotalPoints.set(0);
+        compileMissCalls.set(0);
+        compileMissNanos.set(0);
+        compileHitCalls.set(0);
+        compileHitNanos.set(0);
+        identityHitCalls.set(0);
         synchronized (batchLock) { largestBatch = 0; }
         mismatches.clear();
         samplesChecked.clear();
