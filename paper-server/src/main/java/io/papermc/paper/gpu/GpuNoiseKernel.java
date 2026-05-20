@@ -371,18 +371,67 @@ public final class GpuNoiseKernel {
             //
             // Blocking write — Java GC could otherwise relocate `positions`
             // between this call and the kernel reading from it.
+            //
+            // Phase 9.7: when `gpuprofile` is on, allocate cl_event handles
+            // for each enqueue so we can query CL_PROFILING_COMMAND_START/END
+            // after the read completes and accumulate per-phase nanos.
+            // Otherwise pass NULL event args and skip the query cost.
+            boolean profile = GlassPaperBenchmark.isProfiling();
+            cl_event eWrite  = profile ? new cl_event() : null;
+            cl_event eKernel = profile ? new cl_event() : null;
+            cl_event eRead   = profile ? new cl_event() : null;
+            long wallStart = profile ? System.nanoTime() : 0;
+
             clEnqueueWriteBuffer(q, posBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count * 3,
-                Pointer.to(positions), 0, null, null);
+                Pointer.to(positions), 0, null, eWrite);
             clEnqueueNDRangeKernel(q, k, 1, null,
                 new long[]{roundUp(count, densityLocalWorkSize)},
-                new long[]{densityLocalWorkSize}, 0, null, null);
+                new long[]{densityLocalWorkSize}, 0, null, eKernel);
             clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count,
-                Pointer.to(outResults), 0, null, null);
+                Pointer.to(outResults), 0, null, eRead);
+
+            if (profile) {
+                long wallEnd = System.nanoTime();
+                long writeNs  = eventDurationNs(eWrite);
+                long kernelNs = eventDurationNs(eKernel);
+                long readNs   = eventDurationNs(eRead);
+                // Queue-latency proxy: time the read command spent in the
+                // host queue before submission (host overhead).
+                long queueLatencyNs = eventQueueLatencyNs(eRead);
+                GlassPaperBenchmark.recordProfile(
+                    writeNs, kernelNs, readNs, queueLatencyNs, wallEnd - wallStart);
+                clReleaseEvent(eWrite);
+                clReleaseEvent(eKernel);
+                clReleaseEvent(eRead);
+            }
         } finally {
             returnSlot(slot);
         }
+    }
+
+    /**
+     * CL_PROFILING_COMMAND_END - CL_PROFILING_COMMAND_START in nanoseconds.
+     * Both timestamps are device-tick-converted to ns by the runtime.
+     */
+    private static long eventDurationNs(cl_event ev) {
+        long[] start = new long[1], end = new long[1];
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START,
+            Sizeof.cl_ulong, Pointer.to(start), null);
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END,
+            Sizeof.cl_ulong, Pointer.to(end),   null);
+        return end[0] - start[0];
+    }
+
+    /** CL_PROFILING_COMMAND_SUBMIT - CL_PROFILING_COMMAND_QUEUED. */
+    private static long eventQueueLatencyNs(cl_event ev) {
+        long[] queued = new long[1], submit = new long[1];
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_QUEUED,
+            Sizeof.cl_ulong, Pointer.to(queued), null);
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_SUBMIT,
+            Sizeof.cl_ulong, Pointer.to(submit), null);
+        return submit[0] - queued[0];
     }
 
     /**

@@ -100,9 +100,18 @@ public final class GpuContext {
         // separate dispatcher threads — no inter-queue events needed.
         cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, chosenDevice, null, null);
 
+        // Phase 9.7 — density queues have profiling enabled so the
+        // `gpuprofile` toggle can capture per-phase timing (write / kernel /
+        // read) via cl_event timestamps. Per-command timestamp recording
+        // overhead is ~a few microseconds and constant regardless of whether
+        // we query the events; the dominant cost is event create + query,
+        // which we only pay when profiling is toggled on.
+        cl_queue_properties qProps = new cl_queue_properties();
+        qProps.addProperty(CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE);
+
         cl_command_queue[] densityQueues = new cl_command_queue[DENSITY_QUEUE_COUNT];
         for (int i = 0; i < DENSITY_QUEUE_COUNT; i++) {
-            densityQueues[i] = clCreateCommandQueueWithProperties(ctx, chosenDevice, null, null);
+            densityQueues[i] = clCreateCommandQueueWithProperties(ctx, chosenDevice, qProps, null);
         }
         LOGGER.info("Created " + DENSITY_QUEUE_COUNT
             + " density command queues for per-slot parallel dispatch.");

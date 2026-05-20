@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Wed, 20 May 2026 10:54:37 -0500
+Subject: [PATCH] GlassPaper: Phase 9.7 gpuprofile console command
+
+Toggle the runtime GPU profiling flag. When on, GpuNoiseKernel captures
+cl_event timestamps per dispatch (write/kernel/read) and accumulates
+per-phase nanos in GlassPaperBenchmark. gpubench prints the breakdown.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index fa6530afb9b1a1132cbab529da1c0623f5433fc6..471b4b25c4a9697000c0c4a2b41bc4bcee7ed619 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -619,6 +619,19 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             return;
+         }
+ 
++        if (msg.equalsIgnoreCase("gpuprofile")) {
++            boolean now = !io.papermc.paper.gpu.GlassPaperBenchmark.isProfiling();
++            io.papermc.paper.gpu.GlassPaperBenchmark.setProfiling(now);
++            if (now) {
++                LOGGER.info("GPU profiling ON. Per-dispatch cl_event timestamps will be captured.");
++                LOGGER.info("Generate fresh terrain, then run gpubench. Toggle off with gpuprofile again.");
++                LOGGER.info("Adds small (~microsecond) overhead per dispatch from event create/query.");
++            } else {
++                LOGGER.info("GPU profiling OFF.");
++            }
++            return;
++        }
++
+         if (msg.equalsIgnoreCase("gpudisable") || msg.equalsIgnoreCase("gpuenable")) {
+             boolean disable = msg.equalsIgnoreCase("gpudisable");
+             io.papermc.paper.gpu.GpuKernelHolder.setDisabled(disable);
