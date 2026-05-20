@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Wed, 20 May 2026 11:48:28 -0500
+Subject: [PATCH] GlassPaper: Phase 9.9 enable NoiseInterpolator dedup + diag
+
+Add NoiseInterpolator to isCacheable() and instrument: log one line per
+unique outer-fn type with the count of cache-marker vs NI nodes, and
+how many of each got scratch slots (refCount >= 2). Previous attempt at
+this was reverted in 9.3 due to ~5% BlendDensity validator mismatch;
+re-investigating with the new diagnostic to localize where divergence
+originates.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+index 80194ce7827289df5229ed75ad62d7db1e677e01..83584c411ae26c0fbb9d4f11a4a541f09b84b624 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -117,6 +117,10 @@ public final class DensityFunctionCompiler {
+     private static final java.util.Set<String> loggedFailures =
+         java.util.concurrent.ConcurrentHashMap.newKeySet();
+ 
++    // Phase 9.9: log NI dedup stats once per outer fn type.
++    private static final java.util.Set<String> niDiagLogged =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
++
+     // ── Scratch-register dedup (GPU equivalent of NoiseChunk.CacheOnce) ──────
+     // First pass walks the tree counting references to cacheable instances
+     // (NoiseChunk.NoiseInterpolator / CacheOnce / CacheAllInCell / FlatCache /
+@@ -136,20 +140,20 @@ public final class DensityFunctionCompiler {
+      * subexpressions worth caching under these, and dedup'ing them on GPU
+      * matches the CPU semantics one-for-one.
+      *
+-     * NoiseInterpolator is deliberately excluded. Bisection showed that
+-     * dedup'ing NoiseInterpolator instances produces ~4.8% BlendDensity
+-     * mismatches with max delta ~5.0 vs ~0.003% / max 0.09 with cache markers
+-     * alone. Root cause not yet identified; suspect interaction with how
+-     * NoiseInterpolator's noiseFiller propagates through nested sub-trees
+-     * (NI's wrapped() is shared across multiple traversal paths in vanilla
+-     * MC's noise router in a way that the simple identity-keyed ref-count
+-     * doesn't capture correctly). Revisit if perf demands it.
++     * Phase 9.9 experiment: NoiseInterpolator is now also eligible. Previous
++     * sessions found ~5 % BlendDensity mismatch when NI was added; root cause
++     * was never identified and the safe ship state excluded it. Re-investigating
++     * with extra diagnostics — if validation still diverges we'll see exactly
++     * which trees and which positions diverge via the gpuvalidate + bytecode
++     * dump path. Toggle off by reverting this commit if perf regression /
++     * correctness issue.
+      */
+     private static boolean isCacheable(DensityFunction fn) {
+         if (fn instanceof NoiseChunk.NoiseChunkDensityFunction) {
+             String cls = fn.getClass().getSimpleName();
+             return cls.equals("CacheOnce") || cls.equals("CacheAllInCell")
+-                || cls.equals("FlatCache") || cls.equals("Cache2D");
++                || cls.equals("FlatCache") || cls.equals("Cache2D")
++                || cls.equals("NoiseInterpolator");
+         }
+         return false;
+     }
+@@ -173,9 +177,24 @@ public final class DensityFunctionCompiler {
+         // Nodes that overflow SCRATCH_CAPACITY simply don't get dedup'd —
+         // they re-emit their inner tree on each reference, same as before.
+         int nextSlot = 0;
++        // Phase 9.9: count NI vs cache-marker dedup distribution per tree.
++        // Logged once per outer fn type to keep noise down.
++        int niTotal = 0, niDedup = 0, cmTotal = 0, cmDedup = 0;
+         for (java.util.Map.Entry<DensityFunction, int[]> e : c.refCounts.entrySet()) {
++            boolean isNI = e.getKey() instanceof NoiseChunk.NoiseInterpolator;
++            if (isNI) niTotal++; else cmTotal++;
+             if (e.getValue()[0] >= 2 && nextSlot < SCRATCH_CAPACITY) {
+                 c.scratchSlots.put(e.getKey(), nextSlot++);
++                if (isNI) niDedup++; else cmDedup++;
++            }
++        }
++        if (niTotal > 0 || niDedup > 0) {
++            String outerType = fn.getClass().getSimpleName();
++            if (niDiagLogged.add(outerType)) {
++                LOGGER.info(String.format(
++                    "[Phase 9.9 diag] Compile of %s: %d cache-marker nodes (%d dedup'd), "
++                  + "%d NoiseInterpolator nodes (%d dedup'd, ≥ 2 refs each)",
++                    outerType, cmTotal, cmDedup, niTotal, niDedup));
+             }
+         }
+ 
