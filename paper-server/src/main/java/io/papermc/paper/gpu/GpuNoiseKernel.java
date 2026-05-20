@@ -345,9 +345,12 @@ public final class GpuNoiseKernel {
         try {
             cl_kernel        k = slot.kernel;
             cl_command_queue q = slot.queue;
+            // Size by count*3, not positions.length: thread-local position
+            // buffers in GpuDispatchQueue are grown with headroom and may
+            // be larger than the actual point count for this dispatch.
             cl_mem posBuf = clCreateBuffer(ctx.context(),
                 CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                (long) Sizeof.cl_double * positions.length,
+                (long) Sizeof.cl_double * count * 3,
                 Pointer.to(positions), null);
             cl_mem outBuf = clCreateBuffer(ctx.context(),
                 CL_MEM_WRITE_ONLY,

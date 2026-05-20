@@ -267,7 +267,10 @@ public final class GpuDispatchQueue {
             totalPoints  += w.count;
         }
 
-        double[] mergedPositions = new double[totalPoints * 3];
+        // Both merged buffers are thread-local. Dispatcher threads are
+        // pinned to the fixed-size pool, so reuse hit rate is ~100%.
+        // Positions buffer is 3x wider than the result buffer.
+        double[] mergedPositions = acquirePositionsBuf(totalPoints);
         for (GpuWorkItem w : group) {
             System.arraycopy(w.positions, 0,
                 mergedPositions, w.batchOffset * 3, w.count * 3);
@@ -304,19 +307,32 @@ public final class GpuDispatchQueue {
         }
     }
 
-    // Per-dispatch-thread reusable result buffer. Sized to the largest
-    // group seen on this thread so far. Stored as a 1-element double[][]
-    // so we can grow it without allocating a new ThreadLocal entry.
+    // Per-dispatch-thread reusable result + positions buffers. Dispatcher
+    // threads are pinned in a fixed-size pool, so each thread keeps a
+    // single growable buffer of each kind. Grown with 2x headroom on
+    // overflow to avoid churn from small fluctuations in batch size.
     private static final ThreadLocal<double[]> RESULT_BUF =
+        ThreadLocal.withInitial(() -> new double[0]);
+    private static final ThreadLocal<double[]> POSITIONS_BUF =
         ThreadLocal.withInitial(() -> new double[0]);
 
     private static double[] acquireResultBuf(int needed) {
         double[] buf = RESULT_BUF.get();
         if (buf.length < needed) {
-            // Grow with headroom so small fluctuations don't churn.
             int grown = Math.max(needed, buf.length * 2);
             buf = new double[grown];
             RESULT_BUF.set(buf);
+        }
+        return buf;
+    }
+
+    private static double[] acquirePositionsBuf(int neededPoints) {
+        int neededDoubles = neededPoints * 3;
+        double[] buf = POSITIONS_BUF.get();
+        if (buf.length < neededDoubles) {
+            int grown = Math.max(neededDoubles, buf.length * 2);
+            buf = new double[grown];
+            POSITIONS_BUF.set(buf);
         }
         return buf;
     }
