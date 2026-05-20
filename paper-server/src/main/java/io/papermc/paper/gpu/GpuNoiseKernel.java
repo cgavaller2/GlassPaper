@@ -49,9 +49,16 @@ public final class GpuNoiseKernel {
     private final BlockingQueue<cl_kernel>    normalNoisePool     = new LinkedBlockingQueue<>();
     private final BlockingQueue<DensitySlot>  densityTreeSlotPool = new LinkedBlockingQueue<>();
 
-    private GpuNoiseKernel(GpuContext ctx, cl_program program) {
+    // Phase 9.6.F — local work-group size for the density-tree kernel,
+    // determined at build time from the device's preferred SIMD width and
+    // the kernel's resource budget. Replaces the hardcoded 64 used since
+    // Phase 7. Portable: NVIDIA warp = 32, AMD wavefront = 64, Intel SIMD8/16/32.
+    private final int densityLocalWorkSize;
+
+    private GpuNoiseKernel(GpuContext ctx, cl_program program, int densityLocalWorkSize) {
         this.ctx     = ctx;
         this.program = program;
+        this.densityLocalWorkSize = densityLocalWorkSize;
     }
 
     public static GpuNoiseKernel build() {
@@ -90,7 +97,15 @@ public final class GpuNoiseKernel {
             return null;
         }
 
-        GpuNoiseKernel result = new GpuNoiseKernel(ctx, program);
+        // Build one density-tree kernel first so we can query its per-device
+        // resource budget. CL_KERNEL_WORK_GROUP_SIZE may be smaller than
+        // CL_DEVICE_MAX_WORK_GROUP_SIZE if the kernel uses many registers
+        // (our 64-double stack does spill on most devices).
+        cl_kernel sampleDk = clCreateKernel(program, "evalDensityTree", null);
+        int localWorkSize = pickLocalWorkSize(sampleDk, ctx.device());
+        clReleaseKernel(sampleDk);
+
+        GpuNoiseKernel result = new GpuNoiseKernel(ctx, program, localWorkSize);
         for (int i = 0; i < POOL_SIZE; i++) {
             result.noisePool.add(clCreateKernel(program, "sampleNoise", null));
             result.normalNoisePool.add(clCreateKernel(program, "sampleNormalNoise", null));
@@ -116,9 +131,45 @@ public final class GpuNoiseKernel {
                               + Sizeof.cl_double * MAX_POOLED_POINTS);
         LOGGER.info(String.format(
             "density.cl compiled, kernel ready. Pre-allocated %d density slots "
-          + "(%d points cap each, %.1f MB pooled GPU memory).",
-            POOL_SIZE, MAX_POOLED_POINTS, pooledBytes / (1024.0 * 1024.0)));
+          + "(%d points cap each, %.1f MB pooled GPU memory). Local work-size: %d.",
+            POOL_SIZE, MAX_POOLED_POINTS, pooledBytes / (1024.0 * 1024.0),
+            localWorkSize));
         return result;
+    }
+
+    /**
+     * Phase 9.6.F — pick a local work-size that aligns to the device's SIMD
+     * width while staying within the kernel's per-WG resource budget.
+     *
+     * Strategy (portable across NVIDIA/AMD/Intel/CPU OpenCL):
+     *   1. Cap at 64 — empirically known good for the density-tree kernel.
+     *      Larger work-groups increase register/private-memory pressure
+     *      from the 64-double stack and tend to drop occupancy.
+     *   2. Cap further at CL_KERNEL_WORK_GROUP_SIZE for this kernel on this
+     *      device (smaller than DEVICE_MAX_WORK_GROUP_SIZE if registers spill).
+     *   3. Round down to a multiple of CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_
+     *      MULTIPLE so we never have a partial SIMD lane.
+     *   4. If rounding gives 0 (preferred > cap), fall back to preferred.
+     */
+    private static int pickLocalWorkSize(cl_kernel kernel, cl_device_id device) {
+        long[] tmp = new long[1];
+        clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_WORK_GROUP_SIZE, Sizeof.size_t, Pointer.to(tmp), null);
+        long maxKernel = tmp[0];
+        clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, Sizeof.size_t,
+            Pointer.to(tmp), null);
+        long preferred = tmp[0];
+        if (preferred <= 0) preferred = 1;  // shouldn't happen, but guard
+
+        long target = Math.min(64L, maxKernel);
+        long aligned = (target / preferred) * preferred;
+        if (aligned <= 0) aligned = Math.min(preferred, maxKernel);
+        int picked = (int) Math.max(1, aligned);
+        LOGGER.info(String.format(
+            "Kernel work-group budget: max=%d, preferred multiple=%d -> picked %d",
+            maxKernel, preferred, picked));
+        return picked;
     }
 
     // ── Borrow / return helpers ───────────────────────────────────────────────
@@ -324,7 +375,8 @@ public final class GpuNoiseKernel {
                 (long) Sizeof.cl_double * count * 3,
                 Pointer.to(positions), 0, null, null);
             clEnqueueNDRangeKernel(q, k, 1, null,
-                new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
+                new long[]{roundUp(count, densityLocalWorkSize)},
+                new long[]{densityLocalWorkSize}, 0, null, null);
             clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count,
                 Pointer.to(outResults), 0, null, null);
@@ -374,7 +426,8 @@ public final class GpuNoiseKernel {
             clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
             clEnqueueNDRangeKernel(q, k, 1, null,
-                new long[]{roundUp(count, 64)}, new long[]{64}, 0, null, null);
+                new long[]{roundUp(count, densityLocalWorkSize)},
+                new long[]{densityLocalWorkSize}, 0, null, null);
             clEnqueueReadBuffer(q, outBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count, Pointer.to(outResults), 0, null, null);
 
