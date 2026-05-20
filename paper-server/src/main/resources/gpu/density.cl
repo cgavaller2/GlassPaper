@@ -34,32 +34,14 @@ static double lerp3(double tx, double ty, double tz,
 static double wrapNoise(double v) {
     return v - floor(v / 33554432.0 + 0.5) * 33554432.0;
 }
-// Phase 9.6.H: TWO parallel versions of the perm/sampleAndLerp/improvedNoise
-// chain. OpenCL 1.2 address spaces are static — the same function can't
-// accept both __local and __global pointers. So:
-//
-//   perm  / sampleAndLerp  / improvedNoise         — read from __local
-//   permG / sampleAndLerpG / improvedNoiseG        — read from __global
-//
-// The __local variants are fed by perlinGetValue's cooperative load and
-// service the common noise path (OP_NOISE / OP_SHIFTED_NOISE / OP_SHIFT_B
-// _NOISE / OP_WEIRD_SCALED_SAMPLER via evalNoise).
-//
-// The __global variants service BlendedNoise (OP_BLENDED_NOISE via
-// evalBlendedNoise → perlinGetValueYScale → improvedNoiseYScale). BlendedNoise
-// is the minority path (~12% of interpolators in vanilla overworld
-// per gpubench) and has three open-coded octave loops that would each
-// need their own cooperative-load barrier — kept simple with __global reads.
-static int perm(int idx, __local const uchar* p) { return (int)(p[idx & 0xFF]); }
-static int permG(int idx, __global const uchar* p) { return (int)(p[idx & 0xFF]); }
-
+static int perm(int idx, __global const uchar* p) { return (int)(p[idx & 0xFF]); }
 static double gradDot(int gi, double x, double y, double z) {
     gi &= 15;
     return (double)GRADIENT[gi][0]*x + (double)GRADIENT[gi][1]*y + (double)GRADIENT[gi][2]*z;
 }
 static double sampleAndLerp(int gx, int gy, int gz,
                              double dx, double wdy, double dz, double dy,
-                             __local const uchar* p) {
+                             __global const uchar* p) {
     int i  = perm(gx,   p), i1 = perm(gx+1, p);
     int i2 = perm(i +gy,p), i3 = perm(i +gy+1,p);
     int i4 = perm(i1+gy,p), i5 = perm(i1+gy+1,p);
@@ -74,76 +56,26 @@ static double sampleAndLerp(int gx, int gy, int gz,
     return lerp3(smoothstep(dx), smoothstep(dy), smoothstep(dz),
                  d,d1,d2,d3,d4,d5,d6,d7);
 }
-static double sampleAndLerpG(int gx, int gy, int gz,
-                             double dx, double wdy, double dz, double dy,
-                             __global const uchar* p) {
-    int i  = permG(gx,   p), i1 = permG(gx+1, p);
-    int i2 = permG(i +gy,p), i3 = permG(i +gy+1,p);
-    int i4 = permG(i1+gy,p), i5 = permG(i1+gy+1,p);
-    double d  = gradDot(permG(i2+gz,  p), dx,     wdy,     dz    );
-    double d1 = gradDot(permG(i4+gz,  p), dx-1.0, wdy,     dz    );
-    double d2 = gradDot(permG(i3+gz,  p), dx,     wdy-1.0, dz    );
-    double d3 = gradDot(permG(i5+gz,  p), dx-1.0, wdy-1.0, dz    );
-    double d4 = gradDot(permG(i2+gz+1,p), dx,     wdy,     dz-1.0);
-    double d5 = gradDot(permG(i4+gz+1,p), dx-1.0, wdy,     dz-1.0);
-    double d6 = gradDot(permG(i3+gz+1,p), dx,     wdy-1.0, dz-1.0);
-    double d7 = gradDot(permG(i5+gz+1,p), dx-1.0, wdy-1.0, dz-1.0);
-    return lerp3(smoothstep(dx), smoothstep(dy), smoothstep(dz),
-                 d,d1,d2,d3,d4,d5,d6,d7);
-}
 static double improvedNoise(double x, double y, double z,
                              double xo, double yo, double zo,
-                             __local const uchar* p) {
+                             __global const uchar* p) {
     double dx=x+xo, dy=y+yo, dz=z+zo;
     int gx=(int)floor(dx), gy=(int)floor(dy), gz=(int)floor(dz);
     double fx=dx-gx, fy=dy-gy, fz=dz-gz;
     return sampleAndLerp(gx,gy,gz, fx,fy,fz,fy, p);
 }
-// Phase 9.6.H: __global version for the single-octave sampleNoise validator
-// (no cooperative load worth doing for a 1-octave path).
-static double improvedNoiseG(double x, double y, double z,
-                              double xo, double yo, double zo,
-                              __global const uchar* p) {
-    double dx=x+xo, dy=y+yo, dz=z+zo;
-    int gx=(int)floor(dx), gy=(int)floor(dy), gz=(int)floor(dz);
-    double fx=dx-gx, fy=dy-gy, fz=dz-gz;
-    return sampleAndLerpG(gx,gy,gz, fx,fy,fz,fy, p);
-}
-// Phase 9.6.H: cooperative load of the active octave's 256 B perm table from
-// __global `perms` into __local `localPerm`. All work-items in the WG hit
-// the same octave at the same time (same bytecode, same broadcast amp from
-// __constant octP), so they all do — or all skip — the load + barrier together.
-// permTables in __global is the source of truth; localPerm is per-WG scratch.
-//
-// Two barriers per active octave:
-//   1. before the cooperative write — wait for the previous iteration's reads
-//      to finish so we don't overwrite memory still being read by a slower warp.
-//   2. after the cooperative write — wait for all warps to finish writing
-//      before any warp starts reading.
-// On the first iteration the first barrier is harmless (no prior reads).
-//
-// Note on early-return: evalDensityTree no longer returns early for id >= count.
-// All WG members must reach every barrier, so inactive lanes execute the
-// bytecode loop and just don't write output. ~2-3 % wasted compute on the
-// trailing partial WG, but barrier correctness requires it.
 static double perlinGetValue(double x, double y, double z,
                               double inputF, double valueF, int nOct, int octBase,
                               __global const double* octP,
-                              __global const uchar*  perms,
-                              __local        uchar*  localPerm) {
+                              __global const uchar*  perms) {
     double result=0.0, is=inputF, vs=valueF;
-    int lid   = get_local_id(0);
-    int lsize = get_local_size(0);
     for (int i=0; i<nOct; i++) {
         int pb = (octBase+i)*4;
         double amp = octP[pb];
         if (amp != 0.0) {
-            barrier(CLK_LOCAL_MEM_FENCE);
-            long base = (long)(octBase+i) * 256;
-            for (int j = lid; j < 256; j += lsize) localPerm[j] = perms[base + j];
-            barrier(CLK_LOCAL_MEM_FENCE);
+            __global const uchar* pt = perms + (long)(octBase+i)*256;
             result += amp * improvedNoise(wrapNoise(x*is), wrapNoise(y*is), wrapNoise(z*is),
-                                          octP[pb+1], octP[pb+2], octP[pb+3], localPerm) * vs;
+                                          octP[pb+1], octP[pb+2], octP[pb+3], pt) * vs;
         }
         is *= 2.0; vs /= 2.0;
     }
@@ -158,21 +90,19 @@ static double evalNoise(int ni, double x, double y, double z,
                          __constant double* noiseParams,
                          __constant int*    noiseInfo,
                          __global const double* octaveParams,
-                         __global const uchar*  permTables,
-                         __local        uchar*  localPerm) {
+                         __global const uchar*  permTables) {
     int pb=ni*5, ib=ni*4;
     double vf=noiseParams[pb], fiF=noiseParams[pb+1], fvF=noiseParams[pb+2],
            siF=noiseParams[pb+3], svF=noiseParams[pb+4];
     int foOff=noiseInfo[ib], soOff=noiseInfo[ib+1], fc=noiseInfo[ib+2], sc=noiseInfo[ib+3];
-    double fv = perlinGetValue(x,y,z,fiF,fvF,fc,foOff,octaveParams,permTables,localPerm);
+    double fv = perlinGetValue(x,y,z,fiF,fvF,fc,foOff,octaveParams,permTables);
     double sv = perlinGetValue(x*1.0181268882175227, y*1.0181268882175227, z*1.0181268882175227,
-                               siF,svF,sc,soOff,octaveParams,permTables,localPerm);
+                               siF,svF,sc,soOff,octaveParams,permTables);
     return (fv+sv)*vf;
 }
 
 // ── ImprovedNoise.noise(x,y,z,yScale,yMax) — full deprecated path ────────────
 // Used by BlendedNoise internally
-// Phase 9.6.H: stays __global (BlendedNoise path — calls sampleAndLerpG).
 static double improvedNoiseYScale(
     double x, double y, double z,
     double xo, double yo, double zo,
@@ -196,15 +126,10 @@ static double improvedNoiseYScale(
     } else {
         d7 = 0.0;
     }
-    return sampleAndLerpG(gx, gy, gz, deltaX, deltaY - d7, deltaZ, deltaY, p);
+    return sampleAndLerp(gx, gy, gz, deltaX, deltaY - d7, deltaZ, deltaY, p);
 }
 
 // ── PerlinNoise.getValue with yScale/yMax (used by BlendedNoise) ─────────────
-// Phase 9.6.H: BlendedNoise path — stays __global, no cooperative load.
-// Adding it here would require 2 barriers per active octave × 3 sub-loops
-// (main 8 + min 16 + max 16 = up to 40 active octaves per BlendedNoise call,
-// so up to 80 barriers per OP_BLENDED_NOISE) — too expensive for the minority
-// path. NVIDIA's L1 cache covers the 256B perm table reads acceptably here.
 static double perlinGetValueYScale(
     double x, double y, double z,
     double yScale, double yMax,
@@ -580,19 +505,11 @@ __kernel void evalDensityTree(
     int count)
 {
     int id = get_global_id(0);
-    // Phase 9.6.H: no early return — perlinGetValue uses cooperative load with
-    // WG-wide barriers, so every WG member must execute the whole bytecode
-    // loop or barriers deadlock. Inactive lanes load 0 coords, compute garbage,
-    // and skip the final output write. ~2-3 % wasted compute on the trailing
-    // partial WG, worth it for the local-memory perm-table speedup.
-    bool active = (id < count);
-    double x = active ? positions[id*3+0] : 0.0;
-    double y = active ? positions[id*3+1] : 0.0;
-    double z = active ? positions[id*3+2] : 0.0;
+    if (id >= count) return;
 
-    // Per-WG cooperative scratch for the active octave's perm table.
-    // Loaded inside perlinGetValue with WG-wide barriers.
-    __local uchar localPerm[256];
+    double x = positions[id*3+0];
+    double y = positions[id*3+1];
+    double z = positions[id*3+2];
 
     double stack[STACK_SIZE];
     double scratch[SCRATCH_SIZE];
@@ -637,7 +554,7 @@ __kernel void evalDensityTree(
             int ni=(int)iOps[ip++];
             double xzS=dArgs[dp++], yS=dArgs[dp++];
             stack[sp++]=evalNoise(ni,x*xzS,y*yS,z*xzS,
-                noiseParams,noiseInfo,octaveParams,permTables,localPerm);
+                noiseParams,noiseInfo,octaveParams,permTables);
             break;
         }
 
@@ -646,7 +563,7 @@ __kernel void evalDensityTree(
             double xzS=dArgs[dp++], yS=dArgs[dp++];
             double sz=stack[--sp], sy=stack[--sp], sx=stack[--sp];
             stack[sp++]=evalNoise(ni,x*xzS+sx,y*yS+sy,z*xzS+sz,
-                noiseParams,noiseInfo,octaveParams,permTables,localPerm);
+                noiseParams,noiseInfo,octaveParams,permTables);
             break;
         }
 
@@ -657,17 +574,13 @@ __kernel void evalDensityTree(
             // ShiftB: getValue(z*xzS + sx, x*xzS + sy, 0 + sz)
             // matches Java: offsetNoise.getValue(z*0.25, x*0.25, 0.0)
             stack[sp++]=evalNoise(ni, z*xzS+sx, x*xzS+sy, 0.0+sz,
-                noiseParams,noiseInfo,octaveParams,permTables,localPerm);
+                noiseParams,noiseInfo,octaveParams,permTables);
             break;
         }
 
         case OP_BLENDED_NOISE: {
             int bi = iOps[ip++];
-            // Stack-overflow defensive guard. sp is WG-uniform under correct
-            // bytecode so all lanes hit this together or none do — early return
-            // is barrier-safe. Under malformed bytecode the tree is broken
-            // anyway and CPU fallback handles it.
-            if (sp >= STACK_SIZE) { if (active) output[id] = 0.0; return; }
+            if (sp >= STACK_SIZE) { output[id] = 0.0; return; }
             stack[sp++] = evalBlendedNoise(bi, x, y, z,
                 blendedScalars, blendedPerlinFactors, blendedPerlinInfo,
                 octaveParams, permTables);
@@ -683,7 +596,7 @@ __kernel void evalDensityTree(
                 : getSphaghettiRarity2D(input);
             // d * abs(noise.getValue(x/d, y/d, z/d))
             double nx = evalNoise(ni, x/d, y/d, z/d,
-                noiseParams, noiseInfo, octaveParams, permTables, localPerm);
+                noiseParams, noiseInfo, octaveParams, permTables);
             stack[sp++] = d * fabs(nx);
             break;
         }
@@ -743,38 +656,30 @@ __kernel void evalDensityTree(
         } // switch
     } // for iter
 
-    if (active) output[id] = (sp > 0) ? stack[sp-1] : 0.0;
+    output[id] = (sp > 0) ? stack[sp-1] : 0.0;
 }
 
 // ── Original single-octave kernel (kept for validation) ──────────────────────
-// No cooperative load — 1 octave, not worth the barrier cost. Uses
-// improvedNoiseG (__global variant) directly.
 __kernel void sampleNoise(
     __global const double* positions, __global const uchar* perm,
     double xo, double yo, double zo, __global double* output, int count)
 {
     int id = get_global_id(0); if (id >= count) return;
-    output[id] = improvedNoiseG(positions[id*3], positions[id*3+1], positions[id*3+2], xo,yo,zo, perm);
+    output[id] = improvedNoise(positions[id*3], positions[id*3+1], positions[id*3+2], xo,yo,zo, perm);
 }
 
 // ── NormalNoise batch kernel (kept for validation) ────────────────────────────
-// Phase 9.6.H: uses the __local cooperative-load perlinGetValue, so it
-// needs the same active-lane / WG-wide-barrier pattern as evalDensityTree.
 #define NORMAL_NOISE_INPUT_FACTOR 1.0181268882175227
 __kernel void sampleNormalNoise(
     __global const double* positions, __global const double* noiseP,
     __global const double* octP, __global const uchar* perms,
     __global double* output, int firstN, int secondN, int count)
 {
-    int id = get_global_id(0);
-    bool active = (id < count);
-    double x = active ? positions[id*3]   : 0.0;
-    double y = active ? positions[id*3+1] : 0.0;
-    double z = active ? positions[id*3+2] : 0.0;
-    __local uchar localPerm[256];
+    int id = get_global_id(0); if (id >= count) return;
+    double x=positions[id*3], y=positions[id*3+1], z=positions[id*3+2];
     double vf=noiseP[0], fiF=noiseP[1], fvF=noiseP[2], siF=noiseP[3], svF=noiseP[4];
-    double fv=perlinGetValue(x,y,z,fiF,fvF,firstN,0,octP,perms,localPerm);
+    double fv=perlinGetValue(x,y,z,fiF,fvF,firstN,0,octP,perms);
     double sv=perlinGetValue(x*NORMAL_NOISE_INPUT_FACTOR,y*NORMAL_NOISE_INPUT_FACTOR,
-                              z*NORMAL_NOISE_INPUT_FACTOR,siF,svF,secondN,firstN,octP,perms,localPerm);
-    if (active) output[id]=(fv+sv)*vf;
+                              z*NORMAL_NOISE_INPUT_FACTOR,siF,svF,secondN,firstN,octP,perms);
+    output[id]=(fv+sv)*vf;
 }
