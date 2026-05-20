@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Wed, 20 May 2026 11:54:33 -0500
+Subject: [PATCH] =?UTF-8?q?GlassPaper:=20Phase=209.9=20=E2=80=94=20log=20e?=
+ =?UTF-8?q?very=20compile's=20cacheable-type=20breakdown?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previous diag gate (niTotal > 0 || niDedup > 0) hid lines when no NIs
+were in the tree — which is exactly the case we needed to confirm.
+Always log once per outer fn type now, breakdown by class name.
+
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+index 83584c411ae26c0fbb9d4f11a4a541f09b84b624..77733ae1799c6a9a329ed7a067b1086ce381d9d7 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctionCompiler.java
+@@ -177,25 +177,32 @@ public final class DensityFunctionCompiler {
+         // Nodes that overflow SCRATCH_CAPACITY simply don't get dedup'd —
+         // they re-emit their inner tree on each reference, same as before.
+         int nextSlot = 0;
+-        // Phase 9.9: count NI vs cache-marker dedup distribution per tree.
+-        // Logged once per outer fn type to keep noise down.
+-        int niTotal = 0, niDedup = 0, cmTotal = 0, cmDedup = 0;
++        // Phase 9.9: count by cacheable type. Logged once per outer fn type.
++        java.util.Map<String, int[]> byType = new java.util.HashMap<>();
+         for (java.util.Map.Entry<DensityFunction, int[]> e : c.refCounts.entrySet()) {
+-            boolean isNI = e.getKey() instanceof NoiseChunk.NoiseInterpolator;
+-            if (isNI) niTotal++; else cmTotal++;
++            String name = e.getKey().getClass().getSimpleName();
++            int[] cd = byType.computeIfAbsent(name, k -> new int[2]); // [count, dedup]
++            cd[0]++;
+             if (e.getValue()[0] >= 2 && nextSlot < SCRATCH_CAPACITY) {
+                 c.scratchSlots.put(e.getKey(), nextSlot++);
+-                if (isNI) niDedup++; else cmDedup++;
++                cd[1]++;
+             }
+         }
+-        if (niTotal > 0 || niDedup > 0) {
+-            String outerType = fn.getClass().getSimpleName();
+-            if (niDiagLogged.add(outerType)) {
+-                LOGGER.info(String.format(
+-                    "[Phase 9.9 diag] Compile of %s: %d cache-marker nodes (%d dedup'd), "
+-                  + "%d NoiseInterpolator nodes (%d dedup'd, ≥ 2 refs each)",
+-                    outerType, cmTotal, cmDedup, niTotal, niDedup));
++        String outerType = fn.getClass().getSimpleName();
++        if (niDiagLogged.add(outerType)) {
++            StringBuilder sb = new StringBuilder();
++            sb.append("[Phase 9.9 diag] Compile of ").append(outerType)
++              .append(": refCounts.size=").append(c.refCounts.size())
++              .append(", slotsUsed=").append(nextSlot);
++            if (!byType.isEmpty()) {
++                sb.append(" — types: ");
++                byType.forEach((name, cd) -> sb.append(name)
++                    .append('=').append(cd[0])
++                    .append('(').append(cd[1]).append("d) "));
++            } else {
++                sb.append(" — no cacheable nodes encountered");
+             }
++            LOGGER.info(sb.toString());
+         }
+ 
+         // Reset state accumulated during the counting pass; pass 2 produces
