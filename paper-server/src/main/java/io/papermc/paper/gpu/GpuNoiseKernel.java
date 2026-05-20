@@ -394,17 +394,30 @@ public final class GpuNoiseKernel {
 
             if (profile) {
                 long wallEnd = System.nanoTime();
-                long writeNs  = eventDurationNs(eWrite);
-                long kernelNs = eventDurationNs(eKernel);
-                long readNs   = eventDurationNs(eRead);
-                // Queue-latency proxy: time the read command spent in the
-                // host queue before submission (host overhead).
-                long queueLatencyNs = eventQueueLatencyNs(eRead);
-                GlassPaperBenchmark.recordProfile(
-                    writeNs, kernelNs, readNs, queueLatencyNs, wallEnd - wallStart);
-                clReleaseEvent(eWrite);
-                clReleaseEvent(eKernel);
-                clReleaseEvent(eRead);
+                // Defensive: profiling is a measurement feature. If the
+                // device/driver/JOCL combo doesn't actually expose profile
+                // info on our queues (CL_PROFILING_INFO_NOT_AVAILABLE), we
+                // log once and disable profile mode globally — never let
+                // the measurement path break the hot dispatch path.
+                try {
+                    long writeNs  = eventDurationNs(eWrite);
+                    long kernelNs = eventDurationNs(eKernel);
+                    long readNs   = eventDurationNs(eRead);
+                    long queueLatencyNs = eventQueueLatencyNs(eRead);
+                    GlassPaperBenchmark.recordProfile(
+                        writeNs, kernelNs, readNs, queueLatencyNs, wallEnd - wallStart);
+                } catch (CLException profileEx) {
+                    if (GlassPaperBenchmark.isProfiling()) {
+                        LOGGER.warning("GPU profiling unavailable on this device/driver "
+                            + "(" + profileEx.getMessage() + "). Disabling profile mode. "
+                            + "Run gpubench to see whatever was collected before this point.");
+                        GlassPaperBenchmark.setProfiling(false);
+                    }
+                } finally {
+                    clReleaseEvent(eWrite);
+                    clReleaseEvent(eKernel);
+                    clReleaseEvent(eRead);
+                }
             }
         } finally {
             returnSlot(slot);

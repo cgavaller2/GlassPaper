@@ -118,6 +118,24 @@ public final class GpuContext {
             densityQueues[i] = clCreateCommandQueue(
                 ctx, chosenDevice, CL_QUEUE_PROFILING_ENABLE, null);
         }
+
+        // Diagnostic: query the actually-set properties on the first density
+        // queue. CL_PROFILING_INFO_NOT_AVAILABLE during dispatch means this
+        // bitfield came back without CL_QUEUE_PROFILING_ENABLE (= 1 << 1 = 2).
+        long[] qpropsActual = new long[1];
+        clGetCommandQueueInfo(densityQueues[0], CL_QUEUE_PROPERTIES,
+            Sizeof.cl_ulong, Pointer.to(qpropsActual), null);
+        boolean profilingActuallySet = (qpropsActual[0] & CL_QUEUE_PROFILING_ENABLE) != 0;
+        LOGGER.info(String.format(
+            "Density queue 0 properties bitfield = 0x%x (profiling=%s, out-of-order=%s)",
+            qpropsActual[0],
+            profilingActuallySet,
+            (qpropsActual[0] & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) != 0));
+        if (!profilingActuallySet) {
+            LOGGER.warning("CL_QUEUE_PROFILING_ENABLE did not stick on density queue. "
+                + "`gpuprofile` will auto-disable on first dispatch. This is a JOCL/driver "
+                + "interaction bug — perf timing breakdown is unavailable on this device.");
+        }
         LOGGER.info("Created " + DENSITY_QUEUE_COUNT
             + " density command queues for per-slot parallel dispatch.");
 
