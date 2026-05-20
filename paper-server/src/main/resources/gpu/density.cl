@@ -18,51 +18,62 @@ __constant int GRADIENT[16][3] = {
     { 1,  1,  0},{ 0, -1,  1},{-1,  1,  0},{ 0, -1, -1}
 };
 
-static double smoothstep(double t) {
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+// Phase 9.11 — inner-noise math switched to FP32. The fractional
+// coordinates (dx/dy/dz) and gradient lerps are bounded in magnitude
+// (dx,dy,dz ∈ [0,1)) and don't need FP64 precision, while RTX 2080 Ti
+// (and consumer Turing in general) has ~26× the FP32 throughput of
+// FP64. Outer arithmetic (x + xo, wrapNoise, accumulator) stays FP64
+// to preserve precision at large block coordinates.
+static float smoothstep(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
-static double lerp(double t, double a, double b)  { return a + t * (b - a); }
-static double lerp2(double tx, double ty, double x0, double x1, double y0, double y1) {
-    return lerp(ty, lerp(tx, x0, x1), lerp(tx, y0, y1));
+static float lerpf(float t, float a, float b)  { return a + t * (b - a); }
+static float lerp2f(float tx, float ty, float x0, float x1, float y0, float y1) {
+    return lerpf(ty, lerpf(tx, x0, x1), lerpf(tx, y0, y1));
 }
-static double lerp3(double tx, double ty, double tz,
-                    double v000, double v100, double v010, double v110,
-                    double v001, double v101, double v011, double v111) {
-    return lerp(tz, lerp2(tx,ty,v000,v100,v010,v110),
-                    lerp2(tx,ty,v001,v101,v011,v111));
+static float lerp3f(float tx, float ty, float tz,
+                    float v000, float v100, float v010, float v110,
+                    float v001, float v101, float v011, float v111) {
+    return lerpf(tz, lerp2f(tx,ty,v000,v100,v010,v110),
+                     lerp2f(tx,ty,v001,v101,v011,v111));
 }
+// wrapNoise stays double — input is large block coord, FP32 would lose
+// precision for coords > ~2^23 ≈ 8M blocks.
 static double wrapNoise(double v) {
     return v - floor(v / 33554432.0 + 0.5) * 33554432.0;
 }
 static int perm(int idx, __global const uchar* p) { return (int)(p[idx & 0xFF]); }
-static double gradDot(int gi, double x, double y, double z) {
+static float gradDot(int gi, float x, float y, float z) {
     gi &= 15;
-    return (double)GRADIENT[gi][0]*x + (double)GRADIENT[gi][1]*y + (double)GRADIENT[gi][2]*z;
+    return (float)GRADIENT[gi][0]*x + (float)GRADIENT[gi][1]*y + (float)GRADIENT[gi][2]*z;
 }
-static double sampleAndLerp(int gx, int gy, int gz,
-                             double dx, double wdy, double dz, double dy,
-                             __global const uchar* p) {
+static float sampleAndLerp(int gx, int gy, int gz,
+                            float dx, float wdy, float dz, float dy,
+                            __global const uchar* p) {
     int i  = perm(gx,   p), i1 = perm(gx+1, p);
     int i2 = perm(i +gy,p), i3 = perm(i +gy+1,p);
     int i4 = perm(i1+gy,p), i5 = perm(i1+gy+1,p);
-    double d  = gradDot(perm(i2+gz,  p), dx,     wdy,     dz    );
-    double d1 = gradDot(perm(i4+gz,  p), dx-1.0, wdy,     dz    );
-    double d2 = gradDot(perm(i3+gz,  p), dx,     wdy-1.0, dz    );
-    double d3 = gradDot(perm(i5+gz,  p), dx-1.0, wdy-1.0, dz    );
-    double d4 = gradDot(perm(i2+gz+1,p), dx,     wdy,     dz-1.0);
-    double d5 = gradDot(perm(i4+gz+1,p), dx-1.0, wdy,     dz-1.0);
-    double d6 = gradDot(perm(i3+gz+1,p), dx,     wdy-1.0, dz-1.0);
-    double d7 = gradDot(perm(i5+gz+1,p), dx-1.0, wdy-1.0, dz-1.0);
-    return lerp3(smoothstep(dx), smoothstep(dy), smoothstep(dz),
-                 d,d1,d2,d3,d4,d5,d6,d7);
+    float d  = gradDot(perm(i2+gz,  p), dx,      wdy,      dz     );
+    float d1 = gradDot(perm(i4+gz,  p), dx-1.0f, wdy,      dz     );
+    float d2 = gradDot(perm(i3+gz,  p), dx,      wdy-1.0f, dz     );
+    float d3 = gradDot(perm(i5+gz,  p), dx-1.0f, wdy-1.0f, dz     );
+    float d4 = gradDot(perm(i2+gz+1,p), dx,      wdy,      dz-1.0f);
+    float d5 = gradDot(perm(i4+gz+1,p), dx-1.0f, wdy,      dz-1.0f);
+    float d6 = gradDot(perm(i3+gz+1,p), dx,      wdy-1.0f, dz-1.0f);
+    float d7 = gradDot(perm(i5+gz+1,p), dx-1.0f, wdy-1.0f, dz-1.0f);
+    return lerp3f(smoothstep(dx), smoothstep(dy), smoothstep(dz),
+                  d,d1,d2,d3,d4,d5,d6,d7);
 }
+// improvedNoise returns double for the perlin-loop accumulator's
+// benefit. Coord arithmetic in double; cast to float for the inner
+// gradient/lerp chain.
 static double improvedNoise(double x, double y, double z,
                              double xo, double yo, double zo,
                              __global const uchar* p) {
     double dx=x+xo, dy=y+yo, dz=z+zo;
     int gx=(int)floor(dx), gy=(int)floor(dy), gz=(int)floor(dz);
-    double fx=dx-gx, fy=dy-gy, fz=dz-gz;
-    return sampleAndLerp(gx,gy,gz, fx,fy,fz,fy, p);
+    float fx=(float)(dx-gx), fy=(float)(dy-gy), fz=(float)(dz-gz);
+    return (double)sampleAndLerp(gx,gy,gz, fx,fy,fz,fy, p);
 }
 static double perlinGetValue(double x, double y, double z,
                               double inputF, double valueF, int nOct, int octBase,
@@ -102,7 +113,8 @@ static double evalNoise(int ni, double x, double y, double z,
 }
 
 // ── ImprovedNoise.noise(x,y,z,yScale,yMax) — full deprecated path ────────────
-// Used by BlendedNoise internally
+// Used by BlendedNoise internally.
+// Phase 9.11: inner sampleAndLerp call is FP32; coord arithmetic stays FP64.
 static double improvedNoiseYScale(
     double x, double y, double z,
     double xo, double yo, double zo,
@@ -126,7 +138,8 @@ static double improvedNoiseYScale(
     } else {
         d7 = 0.0;
     }
-    return sampleAndLerp(gx, gy, gz, deltaX, deltaY - d7, deltaZ, deltaY, p);
+    return (double)sampleAndLerp(gx, gy, gz,
+        (float)deltaX, (float)(deltaY - d7), (float)deltaZ, (float)deltaY, p);
 }
 
 // ── PerlinNoise.getValue with yScale/yMax (used by BlendedNoise) ─────────────
