@@ -106,12 +106,17 @@ public final class GpuContext {
         // overhead is ~a few microseconds and constant regardless of whether
         // we query the events; the dominant cost is event create + query,
         // which we only pay when profiling is toggled on.
-        cl_queue_properties qProps = new cl_queue_properties();
-        qProps.addProperty(CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE);
-
+        //
+        // Use the legacy clCreateCommandQueue API (OpenCL 1.0–1.2, deprecated
+        // in 2.0 but still functional on every conformant runtime including
+        // NVIDIA OpenCL 3.0). The 2.0+ clCreateCommandQueueWithProperties +
+        // cl_queue_properties path didn't transmit the profiling flag through
+        // JOCL — silently fell back to a non-profiling queue, leading to
+        // CL_PROFILING_INFO_NOT_AVAILABLE on every clGetEventProfilingInfo.
         cl_command_queue[] densityQueues = new cl_command_queue[DENSITY_QUEUE_COUNT];
         for (int i = 0; i < DENSITY_QUEUE_COUNT; i++) {
-            densityQueues[i] = clCreateCommandQueueWithProperties(ctx, chosenDevice, qProps, null);
+            densityQueues[i] = clCreateCommandQueue(
+                ctx, chosenDevice, CL_QUEUE_PROFILING_ENABLE, null);
         }
         LOGGER.info("Created " + DENSITY_QUEUE_COUNT
             + " density command queues for per-slot parallel dispatch.");
