@@ -373,10 +373,15 @@ public final class GpuNoiseKernel {
             // between this call and the kernel reading from it.
             //
             // Phase 9.7: when `gpuprofile` is on, allocate cl_event handles
-            // for each enqueue so we can query CL_PROFILING_COMMAND_START/END
-            // after the read completes and accumulate per-phase nanos.
-            // Otherwise pass NULL event args and skip the query cost.
-            boolean profile = GlassPaperBenchmark.isProfiling();
+            // for 1-in-N sampled dispatches so we can query
+            // CL_PROFILING_COMMAND_START/END after the read completes and
+            // accumulate per-phase nanos. Sampling avoids hammering NVIDIA's
+            // per-event-tracking limit under concurrent dispatches.
+            //
+            // shouldProfileThisDispatch() atomically increments the counter
+            // and returns true 1 in profileSampleEvery times. Concurrent
+            // dispatchers never both sample the same index.
+            boolean profile = GlassPaperBenchmark.shouldProfileThisDispatch();
             cl_event eWrite  = profile ? new cl_event() : null;
             cl_event eKernel = profile ? new cl_event() : null;
             cl_event eRead   = profile ? new cl_event() : null;
@@ -407,12 +412,11 @@ public final class GpuNoiseKernel {
                     GlassPaperBenchmark.recordProfile(
                         writeNs, kernelNs, readNs, queueLatencyNs, wallEnd - wallStart);
                 } catch (CLException profileEx) {
-                    if (GlassPaperBenchmark.isProfiling()) {
-                        LOGGER.warning("GPU profiling unavailable on this device/driver "
-                            + "(" + profileEx.getMessage() + "). Disabling profile mode. "
-                            + "Run gpubench to see whatever was collected before this point.");
-                        GlassPaperBenchmark.setProfiling(false);
-                    }
+                    // Don't auto-disable on individual sample failures. NVIDIA
+                    // appears to lose profile-info on some events under heavy
+                    // concurrent dispatch; sampled captures will still
+                    // accumulate over the run. Just count the failure.
+                    GlassPaperBenchmark.recordProfileFailure();
                 } finally {
                     clReleaseEvent(eWrite);
                     clReleaseEvent(eKernel);

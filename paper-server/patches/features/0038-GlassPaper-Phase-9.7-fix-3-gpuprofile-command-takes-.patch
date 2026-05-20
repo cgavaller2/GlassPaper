@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Wed, 20 May 2026 11:17:38 -0500
+Subject: [PATCH] =?UTF-8?q?GlassPaper:=20Phase=209.7=20fix=203=20=E2=80=94?=
+ =?UTF-8?q?=20gpuprofile=20command=20takes=20sample=20rate?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extended syntax:
+  gpuprofile             — toggle on/off
+  gpuprofile on          — explicit on
+  gpuprofile off         — explicit off
+  gpuprofile <N>         — set 1-in-N sample rate, keep on/off
+  gpuprofile on <N>      — both
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index 471b4b25c4a9697000c0c4a2b41bc4bcee7ed619..3d304df63b4dbf8a359d5e6f5dcaa7bf2b577904 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -619,15 +619,45 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             return;
+         }
+ 
+-        if (msg.equalsIgnoreCase("gpuprofile")) {
+-            boolean now = !io.papermc.paper.gpu.GlassPaperBenchmark.isProfiling();
+-            io.papermc.paper.gpu.GlassPaperBenchmark.setProfiling(now);
+-            if (now) {
+-                LOGGER.info("GPU profiling ON. Per-dispatch cl_event timestamps will be captured.");
+-                LOGGER.info("Generate fresh terrain, then run gpubench. Toggle off with gpuprofile again.");
+-                LOGGER.info("Adds small (~microsecond) overhead per dispatch from event create/query.");
++        if (msg.equalsIgnoreCase("gpuprofile") || msg.toLowerCase().startsWith("gpuprofile ")) {
++            String[] parts = msg.trim().split("\\s+");
++            // gpuprofile           — toggle on/off
++            // gpuprofile <N>       — set 1-in-N sample rate, keep current on/off state
++            // gpuprofile on <N>    — explicitly enable and set rate
++            // gpuprofile off       — explicitly disable
++            if (parts.length >= 2) {
++                String arg = parts[1].toLowerCase();
++                if (arg.equals("on")) {
++                    io.papermc.paper.gpu.GlassPaperBenchmark.setProfiling(true);
++                } else if (arg.equals("off")) {
++                    io.papermc.paper.gpu.GlassPaperBenchmark.setProfiling(false);
++                } else {
++                    try {
++                        int n = Integer.parseInt(arg);
++                        io.papermc.paper.gpu.GlassPaperBenchmark.setProfileSampleEvery(n);
++                    } catch (NumberFormatException e) {
++                        LOGGER.info("Usage: gpuprofile [on|off|<sampleRate>]");
++                        return;
++                    }
++                }
++                if (parts.length >= 3) {
++                    try {
++                        int n = Integer.parseInt(parts[2]);
++                        io.papermc.paper.gpu.GlassPaperBenchmark.setProfileSampleEvery(n);
++                    } catch (NumberFormatException ignored) {}
++                }
++            } else {
++                io.papermc.paper.gpu.GlassPaperBenchmark.setProfiling(
++                    !io.papermc.paper.gpu.GlassPaperBenchmark.isProfiling());
++            }
++            boolean on = io.papermc.paper.gpu.GlassPaperBenchmark.isProfiling();
++            int every = io.papermc.paper.gpu.GlassPaperBenchmark.getProfileSampleEvery();
++            if (on) {
++                LOGGER.info(String.format(
++                    "GPU profiling ON, sampling 1 in %d dispatches.", every));
++                LOGGER.info("Generate fresh terrain, then run gpubench. Toggle off with gpuprofile off.");
+             } else {
+-                LOGGER.info("GPU profiling OFF.");
++                LOGGER.info("GPU profiling OFF (sample rate retained at 1-in-" + every + ").");
+             }
+             return;
+         }

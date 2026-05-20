@@ -36,7 +36,16 @@ public final class GlassPaperBenchmark {
     // CL_PROFILING_COMMAND_SUBMIT - QUEUED = host queue overhead.
     // CL_PROFILING_COMMAND_START - SUBMIT = driver scheduling latency.
     private static volatile boolean profileMode = false;
+    // Sample 1 in N dispatches when profiling is on. NVIDIA OpenCL appears
+    // to lose profile-info tracking under heavy concurrent dispatch (37
+    // samples succeeded then CL_PROFILING_INFO_NOT_AVAILABLE started firing
+    // — driver-side per-event-tracking limit hypothesis). Sampling spreads
+    // the captures and reduces concurrent-event pressure on the driver.
+    private static volatile int profileSampleEvery = 32;
+    private static final AtomicLong profileDispatchSeen = new AtomicLong();
+
     private static final AtomicLong profileSamples    = new AtomicLong();
+    private static final AtomicLong profileFailures   = new AtomicLong();
     private static final AtomicLong profileWriteNanos = new AtomicLong();
     private static final AtomicLong profileKernelNanos = new AtomicLong();
     private static final AtomicLong profileReadNanos  = new AtomicLong();
@@ -45,6 +54,26 @@ public final class GlassPaperBenchmark {
 
     public static boolean isProfiling() { return profileMode; }
     public static void setProfiling(boolean p) { profileMode = p; }
+    public static int getProfileSampleEvery() { return profileSampleEvery; }
+    public static void setProfileSampleEvery(int n) {
+        profileSampleEvery = Math.max(1, n);
+    }
+
+    /**
+     * Should this particular dispatch capture profiling events?
+     * Called once per dispatch when profileMode is on. Returns true 1 in
+     * profileSampleEvery times. Atomic counter so concurrent dispatchers
+     * don't all sample the same indices.
+     */
+    public static boolean shouldProfileThisDispatch() {
+        if (!profileMode) return false;
+        long n = profileDispatchSeen.incrementAndGet();
+        return (n % profileSampleEvery) == 0;
+    }
+
+    public static void recordProfileFailure() {
+        profileFailures.incrementAndGet();
+    }
 
     public static void recordProfile(long writeNs, long kernelNs, long readNs,
                                      long queueLatencyNs, long wallNs) {
@@ -385,38 +414,38 @@ public final class GlassPaperBenchmark {
         // optimization (Y-independence, CSE) is worth pursuing vs other paths
         // (CacheOnce priming, batch coalescing tweaks).
         long ps = profileSamples.get();
-        if (ps > 0) {
-            double wMs = profileWriteNanos.get() / 1_000_000.0;
-            double kMs = profileKernelNanos.get() / 1_000_000.0;
-            double rMs = profileReadNanos.get()  / 1_000_000.0;
-            double qMs = profileQueueLatencyNanos.get() / 1_000_000.0;
-            double wallMs = profileWallNanos.get() / 1_000_000.0;
-            double sumMs = wMs + kMs + rMs;
-            double avgWriteUs  = wMs  * 1000.0 / ps;
-            double avgKernelUs = kMs  * 1000.0 / ps;
-            double avgReadUs   = rMs  * 1000.0 / ps;
-            double avgQueueUs  = qMs  * 1000.0 / ps;
-            double avgWallUs   = wallMs * 1000.0 / ps;
+        long pf = profileFailures.get();
+        long pd = profileDispatchSeen.get();
+        if (ps > 0 || pf > 0) {
             LOGGER.info(String.format(
-                "─── GPU profiling (%,d samples) ───", ps));
-            LOGGER.info(String.format(
-                "  PCIe upload (write)  : avg %.1f µs   total %8.1f ms   (%.1f%%)",
-                avgWriteUs, wMs, 100.0 * wMs / wallMs));
-            LOGGER.info(String.format(
-                "  Kernel execution     : avg %.1f µs   total %8.1f ms   (%.1f%%)",
-                avgKernelUs, kMs, 100.0 * kMs / wallMs));
-            LOGGER.info(String.format(
-                "  PCIe download (read) : avg %.1f µs   total %8.1f ms   (%.1f%%)",
-                avgReadUs, rMs, 100.0 * rMs / wallMs));
-            LOGGER.info(String.format(
-                "  Queue / driver gap   : avg %.1f µs   total %8.1f ms   (%.1f%%)",
-                avgQueueUs, qMs, 100.0 * qMs / wallMs));
-            LOGGER.info(String.format(
-                "  Wall time / sample   : avg %.1f µs   (compute %.0f%%, transfer %.0f%%, idle %.0f%%)",
-                avgWallUs,
-                100.0 * kMs / sumMs,
-                100.0 * (wMs + rMs) / sumMs,
-                100.0 * (wallMs - sumMs) / wallMs));
+                "─── GPU profiling (%,d samples / %,d dispatches seen, 1 in %d sampled, %,d failures) ───",
+                ps, pd, profileSampleEvery, pf));
+            if (ps > 0) {
+                double wMs = profileWriteNanos.get() / 1_000_000.0;
+                double kMs = profileKernelNanos.get() / 1_000_000.0;
+                double rMs = profileReadNanos.get()  / 1_000_000.0;
+                double qMs = profileQueueLatencyNanos.get() / 1_000_000.0;
+                double wallMs = profileWallNanos.get() / 1_000_000.0;
+                double sumMs = wMs + kMs + rMs;
+                LOGGER.info(String.format(
+                    "  PCIe upload (write)  : avg %.1f µs   total %8.1f ms   (%.1f%%)",
+                    wMs  * 1000.0 / ps, wMs, 100.0 * wMs / wallMs));
+                LOGGER.info(String.format(
+                    "  Kernel execution     : avg %.1f µs   total %8.1f ms   (%.1f%%)",
+                    kMs  * 1000.0 / ps, kMs, 100.0 * kMs / wallMs));
+                LOGGER.info(String.format(
+                    "  PCIe download (read) : avg %.1f µs   total %8.1f ms   (%.1f%%)",
+                    rMs  * 1000.0 / ps, rMs, 100.0 * rMs / wallMs));
+                LOGGER.info(String.format(
+                    "  Queue / driver gap   : avg %.1f µs   total %8.1f ms   (%.1f%%)",
+                    qMs  * 1000.0 / ps, qMs, 100.0 * qMs / wallMs));
+                LOGGER.info(String.format(
+                    "  Wall time / sample   : avg %.1f µs   (compute %.0f%%, transfer %.0f%%, idle %.0f%%)",
+                    wallMs * 1000.0 / ps,
+                    100.0 * kMs / sumMs,
+                    100.0 * (wMs + rMs) / sumMs,
+                    100.0 * (wallMs - sumMs) / wallMs));
+            }
         }
 
         long cmCalls = compileMissCalls.get(), chCalls = compileHitCalls.get();
@@ -497,6 +526,8 @@ public final class GlassPaperBenchmark {
         compileHitNanos.set(0);
         identityHitCalls.set(0);
         profileSamples.set(0);
+        profileFailures.set(0);
+        profileDispatchSeen.set(0);
         profileWriteNanos.set(0);
         profileKernelNanos.set(0);
         profileReadNanos.set(0);
