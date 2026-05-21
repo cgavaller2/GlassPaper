@@ -90,6 +90,16 @@ public final class GlassPaperBenchmark {
     private static long             largestBatch      = 0;
     private static final Object     batchLock         = new Object();
 
+    // Phase 9.12.A — per-slot static-arg cache hit/miss. Records whether the
+    // 12 GpuCompiledKernel buffer args were already bound from a previous
+    // dispatch on the same slot. High hit rate = lower clSetKernelArg cost
+    // per dispatch. Diagnostic: if hit rate is low (< 30%), consider pinning
+    // kernels to specific slots (kernel-hash-to-slot affinity).
+    private static final AtomicLong argCacheHits   = new AtomicLong();
+    private static final AtomicLong argCacheMisses = new AtomicLong();
+    public static void recordArgCacheHit()   { argCacheHits.incrementAndGet(); }
+    public static void recordArgCacheMiss()  { argCacheMisses.incrementAndGet(); }
+
     private static final AtomicLong blendedFallbacks = new AtomicLong();
 
     public static void recordBlendedFallback() { blendedFallbacks.incrementAndGet(); }
@@ -448,6 +458,17 @@ public final class GlassPaperBenchmark {
             }
         }
 
+        // Phase 9.12.A — static-arg cache hit rate.
+        long argHits   = argCacheHits.get();
+        long argMisses = argCacheMisses.get();
+        if (argHits + argMisses > 0) {
+            long argTotal = argHits + argMisses;
+            double hitPct = (argHits * 100.0) / argTotal;
+            LOGGER.info(String.format(
+                "Static-arg cache: %,d hits / %,d total (%.1f%% hit, %,d misses)",
+                argHits, argTotal, hitPct, argMisses));
+        }
+
         long cmCalls = compileMissCalls.get(), chCalls = compileHitCalls.get();
         long idCalls = identityHitCalls.get();
         if (cmCalls + chCalls + idCalls > 0) {
@@ -534,6 +555,8 @@ public final class GlassPaperBenchmark {
         profileQueueLatencyNanos.set(0);
         profileWallNanos.set(0);
         synchronized (batchLock) { largestBatch = 0; }
+        argCacheHits.set(0);
+        argCacheMisses.set(0);
         mismatches.clear();
         samplesChecked.clear();
         perTypeStats.clear();

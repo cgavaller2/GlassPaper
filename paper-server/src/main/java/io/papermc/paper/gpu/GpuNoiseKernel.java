@@ -32,14 +32,34 @@ public final class GpuNoiseKernel {
      * needs no mutex. Different slots' queues run concurrently on the
      * device (NVIDIA: separate CUDA streams; AMD: separate ACE hardware
      * queues, round-robined by creation order).
+     *
+     * Phase 9.12.A: static kernel-arg caching. cl_kernel preserves arg
+     * state between dispatches, so:
+     *   - arg 0  (posBuf)  is bound once at slot init and never re-bound
+     *     (slot's posBuf is the only buffer ever read by this slot's kernel
+     *     on the pooled path)
+     *   - arg 13 (outBuf)  same, bound once at slot init
+     *   - args 1-12 (kernel-specific buffers from GpuCompiledKernel) only
+     *     need re-binding when the GpuCompiledKernel object changes between
+     *     consecutive dispatches on this slot
+     *   - arg 14 (count) varies per dispatch — always set
+     *
+     * lastGpuKernel tracks which CompiledKernel's buffers are currently bound
+     * to args 1-12. null means args are unbound (slot fresh from init, or
+     * clobbered by the unpooled fallback path).
+     *
+     * Since the slot is single-writer (BlockingQueue exclusive borrow), no
+     * memory barrier is needed — the queue ops provide happens-before.
      */
     private static final class DensitySlot {
         final cl_kernel        kernel;
         final cl_mem           posBuf;  // capacity: MAX_POOLED_POINTS * 3 doubles
         final cl_mem           outBuf;  // capacity: MAX_POOLED_POINTS  doubles
         final cl_command_queue queue;   // dedicated, single-writer, in-order
+        GpuCompiledKernel      lastGpuKernel;  // Phase 9.12.A
         DensitySlot(cl_kernel k, cl_mem pb, cl_mem ob, cl_command_queue q) {
             this.kernel = k; this.posBuf = pb; this.outBuf = ob; this.queue = q;
+            this.lastGpuKernel = null;
         }
     }
 
@@ -123,6 +143,15 @@ public final class GpuNoiseKernel {
                 CL_MEM_WRITE_ONLY,
                 (long) Sizeof.cl_double * MAX_POOLED_POINTS, null, null);
             cl_command_queue dq = ctx.densityQueue(i);
+
+            // Phase 9.12.A — bind slot-local buffer args once. cl_kernel
+            // preserves arg state across dispatches, so these never need to
+            // be re-set on the pooled hot path. The unpooled fallback path
+            // re-binds arg 0 / arg 13 on entry (to its own temp buffers)
+            // and restores the slot-persistent bindings on exit.
+            clSetKernelArg(dk,  0, Sizeof.cl_mem, Pointer.to(pb));
+            clSetKernelArg(dk, 13, Sizeof.cl_mem, Pointer.to(ob));
+
             result.densityTreeSlotPool.add(new DensitySlot(dk, pb, ob, dq));
         }
 
@@ -340,20 +369,46 @@ public final class GpuNoiseKernel {
             cl_mem           outBuf = slot.outBuf;
             cl_command_queue q      = slot.queue;
 
-            clSetKernelArg(k,  0, Sizeof.cl_mem, Pointer.to(posBuf));
-            clSetKernelArg(k,  1, Sizeof.cl_mem, Pointer.to(gpuKernel.iOpsBuf));
-            clSetKernelArg(k,  2, Sizeof.cl_mem, Pointer.to(gpuKernel.dArgsBuf));
-            clSetKernelArg(k,  3, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseParamsBuf));
-            clSetKernelArg(k,  4, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseInfoBuf));
-            clSetKernelArg(k,  5, Sizeof.cl_mem, Pointer.to(gpuKernel.octaveParamsBuf));
-            clSetKernelArg(k,  6, Sizeof.cl_mem, Pointer.to(gpuKernel.permTablesBuf));
-            clSetKernelArg(k,  7, Sizeof.cl_mem, Pointer.to(gpuKernel.splineHeadersBuf));
-            clSetKernelArg(k,  8, Sizeof.cl_mem, Pointer.to(gpuKernel.splineFloatPoolBuf));
-            clSetKernelArg(k,  9, Sizeof.cl_mem, Pointer.to(gpuKernel.splineChildrenBuf));
-            clSetKernelArg(k, 10, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedScalarsBuf));
-            clSetKernelArg(k, 11, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinFactorsBuf));
-            clSetKernelArg(k, 12, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinInfoBuf));
-            clSetKernelArg(k, 13, Sizeof.cl_mem, Pointer.to(outBuf));
+            // Phase 9.12.A — static-arg caching.
+            //
+            // Args 0 (posBuf) and 13 (outBuf) are bound once at slot init in
+            // build() and never change for the pooled path — skip them here.
+            //
+            // Args 1-12 (the 12 buffer pointers from gpuKernel) only need
+            // re-binding when the GpuCompiledKernel identity changes between
+            // consecutive dispatches on this slot. dispatchGroup batches
+            // same-kernel work items together, so within a flush wave a slot
+            // may execute the same gpuKernel multiple times before being
+            // reused for a different one — those repeats are pure hits.
+            //
+            // Across flush waves the slot pool round-robins, so hit rate
+            // depends on kernel diversity vs slot count. With ~5 distinct
+            // kernels per chunk slice and 8 slots, hit rate trends ~20-30%
+            // in steady state per worker-thread arrival; coalescing within
+            // a single dispatchGroup multiplies that.
+            //
+            // Each clSetKernelArg is a driver round-trip — conservative
+            // estimate 1-3 µs per call on NVIDIA OpenCL. Skipping 12 calls
+            // on a hit saves ~12-36 µs of host overhead per dispatch.
+            if (slot.lastGpuKernel != gpuKernel) {
+                clSetKernelArg(k,  1, Sizeof.cl_mem, Pointer.to(gpuKernel.iOpsBuf));
+                clSetKernelArg(k,  2, Sizeof.cl_mem, Pointer.to(gpuKernel.dArgsBuf));
+                clSetKernelArg(k,  3, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseParamsBuf));
+                clSetKernelArg(k,  4, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseInfoBuf));
+                clSetKernelArg(k,  5, Sizeof.cl_mem, Pointer.to(gpuKernel.octaveParamsBuf));
+                clSetKernelArg(k,  6, Sizeof.cl_mem, Pointer.to(gpuKernel.permTablesBuf));
+                clSetKernelArg(k,  7, Sizeof.cl_mem, Pointer.to(gpuKernel.splineHeadersBuf));
+                clSetKernelArg(k,  8, Sizeof.cl_mem, Pointer.to(gpuKernel.splineFloatPoolBuf));
+                clSetKernelArg(k,  9, Sizeof.cl_mem, Pointer.to(gpuKernel.splineChildrenBuf));
+                clSetKernelArg(k, 10, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedScalarsBuf));
+                clSetKernelArg(k, 11, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinFactorsBuf));
+                clSetKernelArg(k, 12, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinInfoBuf));
+                slot.lastGpuKernel = gpuKernel;
+                GlassPaperBenchmark.recordArgCacheMiss();
+            } else {
+                GlassPaperBenchmark.recordArgCacheHit();
+            }
+            // count varies per dispatch — always set.
             clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
 
             // No mutex — the slot's queue is single-writer (this caller).
@@ -499,6 +554,17 @@ public final class GpuNoiseKernel {
 
             clReleaseMemObject(posBuf);
             clReleaseMemObject(outBuf);
+
+            // Phase 9.12.A — this path just clobbered arg 0 and arg 13 with
+            // local temp buffers that we're about to release. Restore the
+            // slot's persistent buffer bindings, and invalidate the per-slot
+            // gpuKernel cache so the next pooled dispatch re-binds args 1-12
+            // (this path also rebound those args, but lastGpuKernel wasn't
+            // updated, so without this it'd skip the rebind and use stale
+            // pointers for one dispatch).
+            clSetKernelArg(slot.kernel,  0, Sizeof.cl_mem, Pointer.to(slot.posBuf));
+            clSetKernelArg(slot.kernel, 13, Sizeof.cl_mem, Pointer.to(slot.outBuf));
+            slot.lastGpuKernel = null;
         } finally {
             returnSlot(slot);
         }
