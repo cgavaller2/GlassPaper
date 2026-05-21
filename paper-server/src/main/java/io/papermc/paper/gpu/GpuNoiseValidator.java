@@ -21,8 +21,17 @@ public final class GpuNoiseValidator {
     private static final int SAMPLE_COUNT = 1000;
 
     // Maximum allowed difference between CPU and GPU results.
-    // Should be effectively zero — any delta indicates a bug.
-    private static final double EPSILON = 1e-9;
+    // Phase 9.11: relaxed from 1e-9 (FP64 era) to 1e-5 to accommodate FP32
+    // noise-math drift. FP32 machine epsilon is ~1.2e-7 per op; compounded
+    // across the lerp3/gradDot/smoothstep chain in sampleAndLerp, expected
+    // worst-case drift is ~1e-6 (observed max ~5.55e-7 in 1000-sample
+    // startup validation). A 1e-5 threshold leaves a ~20× margin above
+    // observed FP32 drift while still catching real bugs (e.g. wrong perm
+    // table index, swapped channels, octave-offset errors all produce
+    // deltas ≫ 1e-5).
+    //
+    // When/if the kernel returns to FP64, this should drop back to 1e-9.
+    private static final double EPSILON = 1e-5;
 
     public static boolean validate(GpuNoiseKernel kernel) {
         LOGGER.info("Running GPU noise validation (" + SAMPLE_COUNT + " samples)...");
@@ -229,10 +238,15 @@ public final class GpuNoiseValidator {
 
             int failures = 0;
             double maxDelta = 0.0;
+            // Phase 9.11: relaxed from 1e-6 to 1e-3. BlendedNoise compounds
+            // many improvedNoiseYScale calls (main 8 octaves + min 16 + max
+            // 16 = up to 40 noise evals per point, each contributing FP32
+            // drift). Per-op epsilon ~1.2e-7 × ~40 octaves × accumulated
+            // ≈ ~1e-4 observed range. 1e-3 leaves ~10× margin.
             for (int i = 0; i < count; i++) {
                 double delta = Math.abs(cpuResults[i] - gpuResults[i]);
                 if (delta > maxDelta) maxDelta = delta;
-                if (delta > 1e-6) {
+                if (delta > 1e-3) {
                     failures++;
                     if (failures <= 5) {
                         LOGGER.severe(String.format(
