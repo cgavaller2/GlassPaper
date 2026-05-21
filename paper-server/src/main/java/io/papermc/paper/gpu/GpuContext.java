@@ -15,15 +15,30 @@ public final class GpuContext {
     //
     // Vendor portability:
     //   - NVIDIA: each queue → CUDA stream; in-order semantics preserved.
+    //     Turing+ supports up to 32 concurrent kernels (Hyper-Q).
     //   - AMD: AMD's OpenCL spawns a driver thread per queue; Southern
     //     Islands+ GPUs round-robin queues across hardware ACEs.
     //     RDNA/CDNA have 4-8 ACEs → 8 queues exploit full HW parallelism.
     //   - Intel: per-thread in-order queues are the standard portable pattern.
     //
+    // Phase 9.12.B — scaled 8 → 16 to attack the ~84% non-kernel "idle" wall
+    // time observed post-Phase-9.11 (kernel exec is only 16% of 1071 µs per
+    // dispatch; the rest is host wait on clEnqueueReadBuffer + driver
+    // overhead). Per-slot pipelines are independent and the dispatch thread
+    // is blocked on its own slot's read, so doubling slot count doubles the
+    // achievable in-flight dispatch count if the device has the capacity.
+    // RTX 2080 Ti has 68 SMs and Hyper-Q allows 32 concurrent kernels;
+    // 16 slots × ~500 work-items per dispatch ≈ 8k work-items concurrent,
+    // still well under SM saturation (4352 FP32 cores). AMD ACE count is
+    // typically 4-8; on those devices the extra queues serialize on the
+    // driver side but cost no more than 8 did — so this is a no-regression
+    // change for vendors with fewer hardware queues.
+    //
     // The original `queue` is retained for the cold-path validators
     // (sampleBatch, sampleNormalNoiseBatch) which run only at startup.
-    // Must match GpuNoiseKernel.POOL_SIZE.
-    public static final int DENSITY_QUEUE_COUNT = 8;
+    // Must match GpuNoiseKernel.POOL_SIZE; GpuDispatchQueue.DISPATCH_POOL_SIZE
+    // tracks this constant.
+    public static final int DENSITY_QUEUE_COUNT = 16;
 
     private final cl_device_id      device;
     private final cl_context        context;
