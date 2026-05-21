@@ -4,6 +4,9 @@ import org.jocl.*;
 import static org.jocl.CL.*;
 
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.DoubleBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -85,7 +88,25 @@ public final class GpuNoiseKernel {
         final cl_kernel kernel;
         final cl_mem    posBuf;
         final cl_mem    outBuf;
-        final double[]  hostResults;  // capacity MAX_POOLED_POINTS
+
+        // Phase 9.13 fix — JOCL requires a DIRECT ByteBuffer for non-blocking
+        // (CL_FALSE) read/write operations; Pointer.to(double[]) is only
+        // allowed with blocking ops. The read DMA target must be a direct BB.
+        // We allocate one per ring entry, sized for MAX_POOLED_POINTS doubles.
+        // Endian must be set explicitly (default is BIG; OpenCL device output
+        // on x86 NVIDIA is little-endian — get it wrong and doubles come back
+        // byte-swapped).
+        //
+        // The write path stays blocking (CL_TRUE) because OpenCL's CL_TRUE
+        // write only blocks until the runtime captures the host pointer to
+        // its staging area — typically ~1-10 µs per Phase 9.7 profiling — and
+        // does NOT wait for prior queue commands to complete. So we can keep
+        // Pointer.to(double[]) for the input positions array and avoid the
+        // input copy/staging cost.
+        final ByteBuffer    outBufferDirect;
+        final DoubleBuffer  outBufferAsDouble;
+        final double[]      hostResults;  // copy target; sized to MAX_POOLED_POINTS
+
         GpuCompiledKernel lastGpuKernel;  // Phase 9.12.A — per-ring-entry arg cache
 
         // In-flight state (mutated by dispatch thread under slot borrow,
@@ -96,7 +117,6 @@ public final class GpuNoiseKernel {
         volatile cl_event readEvent;
         volatile int      pointCount;
         volatile AsyncCallback callback;
-        volatile double[] positionsRef;  // GC root for the input array until DMA completes
 
         // CompletableFuture-based handoff: the dispatch thread, when picking
         // a ring entry it just used, waits on this to ensure the completion
@@ -109,6 +129,15 @@ public final class GpuNoiseKernel {
             this.kernel      = k;
             this.posBuf      = pb;
             this.outBuf      = ob;
+            // Allocate direct off-heap ByteBuffer for the read DMA target.
+            // ByteOrder.nativeOrder() = LITTLE_ENDIAN on x86; OpenCL device
+            // memory on these GPUs is also little-endian. Aligning host
+            // interpretation with device output lets us read doubles
+            // correctly via the DoubleBuffer view.
+            this.outBufferDirect = ByteBuffer
+                .allocateDirect(MAX_POOLED_POINTS * Sizeof.cl_double)
+                .order(ByteOrder.nativeOrder());
+            this.outBufferAsDouble = this.outBufferDirect.asDoubleBuffer();
             this.hostResults = new double[MAX_POOLED_POINTS];
         }
     }
@@ -354,16 +383,24 @@ public final class GpuNoiseKernel {
                 RingEntry entry = pc.entry;
                 cl_event ev = entry.readEvent;
                 AsyncCallback cb = entry.callback;
-                double[] results = entry.hostResults;
                 int pointCount = entry.pointCount;
 
                 try {
                     if (ev != null) {
                         clWaitForEvents(1, new cl_event[]{ev});
                     }
+                    // Copy from the direct ByteBuffer (DMA target) into the
+                    // ring entry's host-side double[] so we can hand a
+                    // plain double[] to the callback. The DoubleBuffer
+                    // view shares storage with outBufferDirect; rewind to
+                    // 0 and bulk-get into entry.hostResults.
+                    // Per-call overhead: pointCount * 8 bytes memcpy
+                    // (~4 KB at 500 points, ~1 µs at 4 GB/s).
+                    entry.outBufferAsDouble.position(0);
+                    entry.outBufferAsDouble.get(entry.hostResults, 0, pointCount);
                     if (cb != null) {
                         try {
-                            cb.onComplete(results, pointCount);
+                            cb.onComplete(entry.hostResults, pointCount);
                         } catch (Throwable t) {
                             LOGGER.warning("GPU completion callback failed: " + t.getMessage());
                         }
@@ -382,7 +419,6 @@ public final class GpuNoiseKernel {
                     // proceed without waiting.
                     entry.readEvent    = null;
                     entry.callback     = null;
-                    entry.positionsRef = null;
                     // Complete the handoff future; any dispatch thread
                     // waiting on it now unblocks.
                     java.util.concurrent.CompletableFuture<Void> f = entry.processed;
@@ -683,24 +719,31 @@ public final class GpuNoiseKernel {
             // dequeues the PendingCompletion.
             entry.pointCount   = count;
             entry.callback     = callback;
-            entry.positionsRef = positions;
             entry.processed    = new java.util.concurrent.CompletableFuture<>();
 
             cl_event readEv = new cl_event();
-            // Non-blocking write — kernel will see the data via in-order
-            // queue semantics. positions stays GC-rooted via positionsRef.
-            clEnqueueWriteBuffer(slot.queue, entry.posBuf, CL_FALSE, 0,
+            // Blocking write (CL_TRUE) — per OpenCL spec, this returns once
+            // the runtime has captured the host data (typically into a
+            // pinned staging buffer or via DMA), NOT after prior queue
+            // commands complete or after the device DMA finishes. Phase 9.7
+            // measured the actual device-side write DMA at 1.1 µs avg, with
+            // the host-side blocking on CL_TRUE typically 5-15 µs total.
+            // This lets us keep Pointer.to(double[]) — JOCL only allows
+            // ByteBuffer for non-blocking ops.
+            clEnqueueWriteBuffer(slot.queue, entry.posBuf, CL_TRUE, 0,
                 (long) Sizeof.cl_double * count * 3,
                 Pointer.to(positions), 0, null, null);
             clEnqueueNDRangeKernel(slot.queue, k, 1, null,
                 new long[]{roundUp(count, densityLocalWorkSize)},
                 new long[]{densityLocalWorkSize}, 0, null, null);
-            // Non-blocking read into entry.hostResults (per-ring-entry,
-            // safe to write concurrent with other rings/slots). The event
-            // is what the completion thread waits on.
+            // Non-blocking read into entry.outBufferDirect (direct
+            // ByteBuffer, required by JOCL for CL_FALSE). The event
+            // is what the completion thread waits on. Rewind the BB
+            // position so the next read overwrites from byte 0.
+            entry.outBufferDirect.position(0);
             clEnqueueReadBuffer(slot.queue, entry.outBuf, CL_FALSE, 0,
                 (long) Sizeof.cl_double * count,
-                Pointer.to(entry.hostResults), 0, null, readEv);
+                Pointer.to(entry.outBufferDirect), 0, null, readEv);
 
             entry.readEvent = readEv;
             // Hand off to completion thread. After this push, the entry
@@ -977,6 +1020,8 @@ public final class GpuNoiseKernel {
             cl_event ev = entry.readEvent;
             try {
                 if (ev != null) clWaitForEvents(1, new cl_event[]{ev});
+                entry.outBufferAsDouble.position(0);
+                entry.outBufferAsDouble.get(entry.hostResults, 0, entry.pointCount);
                 if (entry.callback != null) {
                     try { entry.callback.onComplete(entry.hostResults, entry.pointCount); }
                     catch (Throwable ignored) {}
