@@ -7,6 +7,8 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 public final class GpuNoiseKernel {
@@ -25,41 +27,151 @@ public final class GpuNoiseKernel {
     // Removes ~20-50µs of cl_mem create/release latency per dispatch.
     private static final int MAX_POOLED_POINTS = 32768;
 
+    // Phase 9.13 — per-slot ring depth for async dispatch. Each slot keeps
+    // RING_DEPTH worth of (posBuf, outBuf, hostResults, kernel) tuples. The
+    // dispatch thread can enqueue a new write/kernel/read in any free ring
+    // entry without waiting for prior dispatches on the same slot to
+    // complete. The slot's command queue serializes them in submission
+    // order (in-order semantics), but the host doesn't block per-dispatch.
+    //
+    // A dedicated completion thread waits on the read event of each in-flight
+    // ring entry and runs the user callback (split merged result back into
+    // per-item slices, complete the worker futures). This decouples
+    // worker-future delivery from the dispatch-thread's enqueue path.
+    //
+    // K=4 was chosen as a balance:
+    //   - Higher K = more concurrent device work, more memory.
+    //   - K=4 with 8 slots = up to 32 in-flight, matches NVIDIA Hyper-Q's
+    //     max concurrent streams on Turing (RTX 2080 Ti).
+    //   - Memory: 8 slots × 4 ring × (786 KB pos + 262 KB out) ≈ 33 MB GPU
+    //     plus 8 × 4 × 32 KB ≈ 1 MB host. Negligible.
+    private static final int RING_DEPTH = 4;
+
     /**
-     * Density-tree kernel + dedicated input/output buffers + dedicated
-     * in-order command queue (Phase 9.5). Each slot is borrowed by at most
-     * one dispatcher thread at a time, so the queue is single-writer and
-     * needs no mutex. Different slots' queues run concurrently on the
-     * device (NVIDIA: separate CUDA streams; AMD: separate ACE hardware
-     * queues, round-robined by creation order).
+     * Phase 9.13 — callback invoked by the completion thread when a previously
+     * enqueued async dispatch's read DMA has finished. Receives the
+     * host-side result buffer and the point count that was enqueued.
      *
-     * Phase 9.12.A: static kernel-arg caching. cl_kernel preserves arg
-     * state between dispatches, so:
-     *   - arg 0  (posBuf)  is bound once at slot init and never re-bound
-     *     (slot's posBuf is the only buffer ever read by this slot's kernel
-     *     on the pooled path)
-     *   - arg 13 (outBuf)  same, bound once at slot init
-     *   - args 1-12 (kernel-specific buffers from GpuCompiledKernel) only
-     *     need re-binding when the GpuCompiledKernel object changes between
-     *     consecutive dispatches on this slot
-     *   - arg 14 (count) varies per dispatch — always set
+     * Runs on the completion thread, NOT on the dispatch pool thread that
+     * enqueued the work. Should be quick (e.g. arraycopy + future.complete);
+     * any heavy work should be deferred to the consumer thread.
      *
-     * lastGpuKernel tracks which CompiledKernel's buffers are currently bound
-     * to args 1-12. null means args are unbound (slot fresh from init, or
-     * clobbered by the unpooled fallback path).
+     * If the dispatch fails (e.g. CL error mid-enqueue), the callback is
+     * invoked with onFailure() instead. The implementation is responsible
+     * for signaling CPU fallback to its consumers.
+     */
+    public interface AsyncCallback {
+        void onComplete(double[] hostResults, int pointCount);
+        default void onFailure(Throwable cause) {}
+    }
+
+    /**
+     * Phase 9.13 — one slot of the per-slot ring. Each ring entry owns its
+     * own (posBuf, outBuf, hostResults, kernel) so multiple dispatches can
+     * be enqueued on the same slot's command queue without their buffers
+     * stomping on each other.
      *
-     * Since the slot is single-writer (BlockingQueue exclusive borrow), no
-     * memory barrier is needed — the queue ops provide happens-before.
+     * The kernel object is per-ring-entry (not shared across the slot) so
+     * Phase 9.12.A's static arg state survives across cycles of this ring
+     * entry. Arg 0 (posBuf) and arg 13 (outBuf) are bound once at init.
+     * lastGpuKernel tracks args 1-12.
+     *
+     * State machine:
+     *   FREE: entry not in use; safe for a dispatch thread to enqueue
+     *   IN_FLIGHT: enqueueWrite/Kernel/Read have been called; completion
+     *              thread will eventually move it back to FREE
+     */
+    private static final class RingEntry {
+        final cl_kernel kernel;
+        final cl_mem    posBuf;
+        final cl_mem    outBuf;
+        final double[]  hostResults;  // capacity MAX_POOLED_POINTS
+        GpuCompiledKernel lastGpuKernel;  // Phase 9.12.A — per-ring-entry arg cache
+
+        // In-flight state (mutated by dispatch thread under slot borrow,
+        // read by completion thread). The handoff is via the completion
+        // queue — once a (ringEntry, event, callback) tuple is pushed,
+        // the dispatch thread must not touch the entry until the completion
+        // thread signals it free via processed.complete().
+        volatile cl_event readEvent;
+        volatile int      pointCount;
+        volatile AsyncCallback callback;
+        volatile double[] positionsRef;  // GC root for the input array until DMA completes
+
+        // CompletableFuture-based handoff: the dispatch thread, when picking
+        // a ring entry it just used, waits on this to ensure the completion
+        // thread is done with it. The completion thread completes this
+        // future after invoking the callback and releasing the cl_event.
+        // null means the entry has never been used.
+        volatile java.util.concurrent.CompletableFuture<Void> processed;
+
+        RingEntry(cl_kernel k, cl_mem pb, cl_mem ob) {
+            this.kernel      = k;
+            this.posBuf      = pb;
+            this.outBuf      = ob;
+            this.hostResults = new double[MAX_POOLED_POINTS];
+        }
+    }
+
+    /**
+     * Density-tree slot — bundles a per-slot in-order command queue (Phase 9.5)
+     * with a ring of RING_DEPTH RingEntry tuples (Phase 9.13). Each slot is
+     * borrowed by at most one dispatcher thread at a time, so the queue is
+     * single-writer and needs no mutex. Different slots' queues run
+     * concurrently on the device (NVIDIA: separate CUDA streams; AMD:
+     * separate ACE hardware queues, round-robined by creation order).
+     *
+     * Phase 9.13: instead of one (kernel, posBuf, outBuf) per slot the slot
+     * has RING_DEPTH of them in a ring buffer, accessed round-robin via
+     * nextRingIndex. The dispatch thread, on borrow, picks ring[i] and
+     * waits (if needed) for the completion thread to have finished any
+     * previous use of ring[i] before enqueueing on it. With ring depth 4
+     * and the dispatch thread + completion thread typically operating at
+     * similar rates, the wait is rare in steady state.
+     *
+     * Kept legacy sync fields (kernel, posBuf, outBuf, lastGpuKernel) for
+     * the validator path that calls evalDensityTreeFast at startup — those
+     * use blocking writes/reads and don't engage the ring.
      */
     private static final class DensitySlot {
-        final cl_kernel        kernel;
-        final cl_mem           posBuf;  // capacity: MAX_POOLED_POINTS * 3 doubles
-        final cl_mem           outBuf;  // capacity: MAX_POOLED_POINTS  doubles
-        final cl_command_queue queue;   // dedicated, single-writer, in-order
-        GpuCompiledKernel      lastGpuKernel;  // Phase 9.12.A
-        DensitySlot(cl_kernel k, cl_mem pb, cl_mem ob, cl_command_queue q) {
-            this.kernel = k; this.posBuf = pb; this.outBuf = ob; this.queue = q;
+        // Phase 9.5 — per-slot in-order command queue
+        final cl_command_queue queue;
+
+        // Phase 9.13 — async dispatch ring
+        final RingEntry[] ring;
+        int nextRingIndex;  // mutated only by dispatch thread under slot borrow
+
+        // Legacy sync path — used by validators and the unpooled fallback.
+        // Owns its own kernel/posBuf/outBuf so it can coexist on the same
+        // command queue as ring entries without arg-state collision.
+        final cl_kernel kernel;
+        final cl_mem    posBuf;
+        final cl_mem    outBuf;
+        GpuCompiledKernel lastGpuKernel;  // Phase 9.12.A — for the sync path
+
+        DensitySlot(cl_command_queue q, RingEntry[] ring,
+                    cl_kernel k, cl_mem pb, cl_mem ob) {
+            this.queue   = q;
+            this.ring    = ring;
+            this.kernel  = k;
+            this.posBuf  = pb;
+            this.outBuf  = ob;
             this.lastGpuKernel = null;
+            this.nextRingIndex = 0;
+        }
+    }
+
+    /**
+     * Phase 9.13 — pending completion record. Pushed by the dispatch thread
+     * after enqueueing the async write/kernel/read; popped by the completion
+     * thread, which waits on the readEvent and invokes the callback.
+     */
+    private static final class PendingCompletion {
+        final RingEntry entry;
+        // Holding refs to the cl_event and the slot's queue is sufficient;
+        // everything else lives on the RingEntry.
+        PendingCompletion(RingEntry entry) {
+            this.entry = entry;
         }
     }
 
@@ -74,6 +186,19 @@ public final class GpuNoiseKernel {
     // the kernel's resource budget. Replaces the hardcoded 64 used since
     // Phase 7. Portable: NVIDIA warp = 32, AMD wavefront = 64, Intel SIMD8/16/32.
     private final int densityLocalWorkSize;
+
+    // Phase 9.13 — async dispatch infrastructure.
+    // pendingCompletions: dispatch thread pushes (RingEntry) after enqueueing
+    // async work; completion thread takes one, clWaitForEvents on its
+    // entry.readEvent, invokes entry.callback, releases the event, and
+    // completes entry.processed so a future dispatch can reuse this entry.
+    //
+    // BlockingQueue gives the completion thread efficient wakeup on push
+    // and bounded by JVM heap (we never queue more than POOL_SIZE × RING_DEPTH
+    // before backpressure kicks in on the dispatch side).
+    private final BlockingQueue<PendingCompletion> pendingCompletions = new LinkedBlockingQueue<>();
+    private Thread completionThread;
+    private volatile boolean completionRunning;
 
     private GpuNoiseKernel(GpuContext ctx, cl_program program, int densityLocalWorkSize) {
         this.ctx     = ctx;
@@ -135,6 +260,10 @@ public final class GpuNoiseKernel {
             // kernel; positions are re-uploaded with clEnqueueWriteBuffer on
             // each dispatch. The dedicated queue means dispatches from
             // different slots run concurrently on the device.
+            // Sync path's kernel + buffers (Phase 9.4 + 9.12.A).
+            // Used by validators at startup. Bound once with its own posBuf
+            // / outBuf so the sync path doesn't collide with ring entries'
+            // arg state on the same slot.
             cl_kernel dk = clCreateKernel(program, "evalDensityTree", null);
             cl_mem pb = clCreateBuffer(ctx.context(),
                 CL_MEM_READ_ONLY,
@@ -144,26 +273,126 @@ public final class GpuNoiseKernel {
                 (long) Sizeof.cl_double * MAX_POOLED_POINTS, null, null);
             cl_command_queue dq = ctx.densityQueue(i);
 
-            // Phase 9.12.A — bind slot-local buffer args once. cl_kernel
-            // preserves arg state across dispatches, so these never need to
-            // be re-set on the pooled hot path. The unpooled fallback path
-            // re-binds arg 0 / arg 13 on entry (to its own temp buffers)
-            // and restores the slot-persistent bindings on exit.
+            // Phase 9.12.A — bind sync-path persistent args once.
             clSetKernelArg(dk,  0, Sizeof.cl_mem, Pointer.to(pb));
             clSetKernelArg(dk, 13, Sizeof.cl_mem, Pointer.to(ob));
 
-            result.densityTreeSlotPool.add(new DensitySlot(dk, pb, ob, dq));
+            // Phase 9.13 — allocate ring of RING_DEPTH (kernel, posBuf, outBuf)
+            // tuples. Each ring entry's kernel has its arg 0 / arg 13 bound
+            // once to its own buffers, so the static-arg cache (9.12.A) only
+            // needs to manage args 1-12 from the GpuCompiledKernel.
+            RingEntry[] ring = new RingEntry[RING_DEPTH];
+            for (int r = 0; r < RING_DEPTH; r++) {
+                cl_kernel rk = clCreateKernel(program, "evalDensityTree", null);
+                cl_mem rpb = clCreateBuffer(ctx.context(),
+                    CL_MEM_READ_ONLY,
+                    (long) Sizeof.cl_double * MAX_POOLED_POINTS * 3, null, null);
+                cl_mem rob = clCreateBuffer(ctx.context(),
+                    CL_MEM_WRITE_ONLY,
+                    (long) Sizeof.cl_double * MAX_POOLED_POINTS, null, null);
+                clSetKernelArg(rk,  0, Sizeof.cl_mem, Pointer.to(rpb));
+                clSetKernelArg(rk, 13, Sizeof.cl_mem, Pointer.to(rob));
+                ring[r] = new RingEntry(rk, rpb, rob);
+            }
+
+            result.densityTreeSlotPool.add(new DensitySlot(dq, ring, dk, pb, ob));
         }
 
-        long pooledBytes =
-            (long) POOL_SIZE * (Sizeof.cl_double * MAX_POOLED_POINTS * 3
-                              + Sizeof.cl_double * MAX_POOLED_POINTS);
+        // Pooled memory: sync path's buffers + ring entries' buffers.
+        long syncBytes = (long) POOL_SIZE
+            * (Sizeof.cl_double * MAX_POOLED_POINTS * 3
+             + Sizeof.cl_double * MAX_POOLED_POINTS);
+        long ringBytes = (long) POOL_SIZE * RING_DEPTH
+            * (Sizeof.cl_double * MAX_POOLED_POINTS * 3
+             + Sizeof.cl_double * MAX_POOLED_POINTS);
         LOGGER.info(String.format(
             "density.cl compiled, kernel ready. Pre-allocated %d density slots "
-          + "(%d points cap each, %.1f MB pooled GPU memory). Local work-size: %d.",
-            POOL_SIZE, MAX_POOLED_POINTS, pooledBytes / (1024.0 * 1024.0),
+          + "× (1 sync + %d async ring entries), %d points cap each, "
+          + "%.1f MB pooled GPU memory total. Local work-size: %d.",
+            POOL_SIZE, RING_DEPTH, MAX_POOLED_POINTS,
+            (syncBytes + ringBytes) / (1024.0 * 1024.0),
             localWorkSize));
+
+        // Phase 9.13 — start the completion thread that drains
+        // pendingCompletions, waits on each entry's read event, invokes
+        // its callback, and frees the ring entry for reuse.
+        result.startCompletionThread();
+
         return result;
+    }
+
+    /**
+     * Phase 9.13 — completion thread. Drains the pendingCompletions queue,
+     * one entry at a time, and for each:
+     *   1. clWaitForEvents on entry.readEvent — blocks until the device
+     *      finishes the kernel + DMA read on this ring entry.
+     *   2. Invoke entry.callback with the host-side result buffer.
+     *   3. clReleaseEvent and clear in-flight state.
+     *   4. Complete entry.processed so a future dispatch on this ring entry
+     *      can proceed.
+     *
+     * Single thread is sufficient: it's I/O-bound (blocks in
+     * clWaitForEvents) so it only consumes CPU when work completes; events
+     * complete roughly at the device's throughput rate (~one every 200 µs
+     * at 5× overlap and 1 ms wall), so a single thread keeps up easily.
+     *
+     * If we ever measure thread-bound completion, we can shard by slot.
+     */
+    private void startCompletionThread() {
+        completionRunning = true;
+        completionThread = new Thread(() -> {
+            while (completionRunning) {
+                PendingCompletion pc;
+                try {
+                    pc = pendingCompletions.poll(50, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (pc == null) continue;
+
+                RingEntry entry = pc.entry;
+                cl_event ev = entry.readEvent;
+                AsyncCallback cb = entry.callback;
+                double[] results = entry.hostResults;
+                int pointCount = entry.pointCount;
+
+                try {
+                    if (ev != null) {
+                        clWaitForEvents(1, new cl_event[]{ev});
+                    }
+                    if (cb != null) {
+                        try {
+                            cb.onComplete(results, pointCount);
+                        } catch (Throwable t) {
+                            LOGGER.warning("GPU completion callback failed: " + t.getMessage());
+                        }
+                    }
+                } catch (Throwable t) {
+                    LOGGER.warning("GPU completion failed: " + t.getMessage());
+                    if (cb != null) {
+                        try { cb.onFailure(t); } catch (Throwable ignored) {}
+                    }
+                } finally {
+                    if (ev != null) {
+                        try { clReleaseEvent(ev); } catch (Throwable ignored) {}
+                    }
+                    // Clear in-flight state. The dispatch thread that next
+                    // picks up this ring entry will see processed==done and
+                    // proceed without waiting.
+                    entry.readEvent    = null;
+                    entry.callback     = null;
+                    entry.positionsRef = null;
+                    // Complete the handoff future; any dispatch thread
+                    // waiting on it now unblocks.
+                    java.util.concurrent.CompletableFuture<Void> f = entry.processed;
+                    if (f != null) f.complete(null);
+                }
+            }
+        }, "GlassPaper-GPU-Completion");
+        completionThread.setDaemon(true);
+        completionThread.setPriority(Thread.NORM_PRIORITY + 1);
+        completionThread.start();
     }
 
     /**
@@ -336,6 +565,157 @@ public final class GpuNoiseKernel {
             evalDensityTreeUnpooled(positions, gpuKernel, count, outResults);
         } else {
             evalDensityTreePooled(positions, gpuKernel, count, outResults);
+        }
+    }
+
+    /**
+     * Phase 9.13 — async dispatch.
+     *
+     * Enqueues a non-blocking write/kernel/read on a per-slot ring entry
+     * and returns IMMEDIATELY. The completion thread, when the device
+     * finishes the DMA read, invokes the callback with the ring entry's
+     * host-side result buffer.
+     *
+     * Concurrency:
+     *   - The dispatch thread borrows a slot, picks the next ring entry
+     *     (round-robin within the slot), waits if that entry is still
+     *     in-flight from a previous use (via entry.processed future),
+     *     enqueues the new work non-blocking, pushes to the completion
+     *     queue, and returns the slot.
+     *   - The completion thread takes from the completion queue, blocks
+     *     on the read event via clWaitForEvents, invokes the callback,
+     *     releases the event, and completes the entry's processed future.
+     *
+     * Memory safety:
+     *   - The Java `positions` array is held alive in entry.positionsRef
+     *     until the read completes (GC root). The kernel reads from
+     *     entry.posBuf, not directly from `positions` — the write DMA
+     *     copies from `positions` to entry.posBuf at submission time.
+     *     We use CL_FALSE (non-blocking) for the write, so the host could
+     *     in theory move on before the DMA finishes; the read event
+     *     transitively waits on the write through in-order queue
+     *     semantics, so positions stays valid for the necessary window.
+     *   - entry.hostResults is per-ring-entry, so two in-flight dispatches
+     *     on the same slot don't share output buffers.
+     *
+     * Backpressure: when all RING_DEPTH entries of a slot are in-flight,
+     * the dispatch thread waits on the next entry's processed future
+     * before reusing it. With 8 slots × 4 entries = 32 in-flight max
+     * before a single dispatch thread blocks; in practice the flusher
+     * cycles much faster than the device, so the host catches up quickly.
+     *
+     * Callers must not read or write {@code positions} until the callback
+     * fires — the dispatch path treats it as read-only and the DMA writes
+     * its contents to GPU memory.
+     */
+    public void evalDensityTreeAsync(double[] positions,
+                                     GpuCompiledKernel gpuKernel,
+                                     int count,
+                                     AsyncCallback callback) {
+        if (count > MAX_POOLED_POINTS) {
+            // Oversize fallback: do it synchronously, then invoke callback
+            // inline. We don't expect this path on the hot dispatch flow;
+            // it's preserved so an unusually large coalesced batch doesn't
+            // crash. The callback runs on the calling thread.
+            double[] results = new double[count];
+            try {
+                evalDensityTreeUnpooled(positions, gpuKernel, count, results);
+                callback.onComplete(results, count);
+            } catch (Throwable t) {
+                callback.onFailure(t);
+            }
+            return;
+        }
+
+        DensitySlot slot = borrowSlot();
+        boolean enqueued = false;
+        try {
+            // Round-robin ring index. Each slot's ring entries cycle through
+            // 0,1,2,3,0,1,2,3,... per dispatch.
+            int idx = slot.nextRingIndex;
+            slot.nextRingIndex = (idx + 1) % RING_DEPTH;
+            RingEntry entry = slot.ring[idx];
+
+            // If this entry has been used before, the completion thread is
+            // (or was) processing the previous use. Wait for it to finish.
+            // entry.processed.complete(null) is called by the completion
+            // thread after invoking the previous callback and releasing
+            // the previous event.
+            java.util.concurrent.CompletableFuture<Void> prevProcessed = entry.processed;
+            if (prevProcessed != null && !prevProcessed.isDone()) {
+                // Bounded wait so we never deadlock on a dropped completion.
+                // 5s is generous — a single dispatch's wall is ~1 ms.
+                try {
+                    prevProcessed.get(5, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                        "Ring entry " + idx + " on slot stuck in-flight: " + e, e);
+                }
+            }
+
+            // Phase 9.12.A — per-ring-entry static-arg caching. Arg 0
+            // (posBuf) and arg 13 (outBuf) were bound once at slot init.
+            // Args 1-12 only rebound when the GpuCompiledKernel changes
+            // for this ring entry.
+            cl_kernel k = entry.kernel;
+            if (entry.lastGpuKernel != gpuKernel) {
+                clSetKernelArg(k,  1, Sizeof.cl_mem, Pointer.to(gpuKernel.iOpsBuf));
+                clSetKernelArg(k,  2, Sizeof.cl_mem, Pointer.to(gpuKernel.dArgsBuf));
+                clSetKernelArg(k,  3, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseParamsBuf));
+                clSetKernelArg(k,  4, Sizeof.cl_mem, Pointer.to(gpuKernel.noiseInfoBuf));
+                clSetKernelArg(k,  5, Sizeof.cl_mem, Pointer.to(gpuKernel.octaveParamsBuf));
+                clSetKernelArg(k,  6, Sizeof.cl_mem, Pointer.to(gpuKernel.permTablesBuf));
+                clSetKernelArg(k,  7, Sizeof.cl_mem, Pointer.to(gpuKernel.splineHeadersBuf));
+                clSetKernelArg(k,  8, Sizeof.cl_mem, Pointer.to(gpuKernel.splineFloatPoolBuf));
+                clSetKernelArg(k,  9, Sizeof.cl_mem, Pointer.to(gpuKernel.splineChildrenBuf));
+                clSetKernelArg(k, 10, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedScalarsBuf));
+                clSetKernelArg(k, 11, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinFactorsBuf));
+                clSetKernelArg(k, 12, Sizeof.cl_mem, Pointer.to(gpuKernel.blendedPerlinInfoBuf));
+                entry.lastGpuKernel = gpuKernel;
+                GlassPaperBenchmark.recordArgCacheMiss();
+            } else {
+                GlassPaperBenchmark.recordArgCacheHit();
+            }
+            clSetKernelArg(k, 14, Sizeof.cl_int, Pointer.to(new int[]{count}));
+
+            // Stage in-flight state BEFORE enqueueing the read event:
+            // the completion thread should see consistent fields when it
+            // dequeues the PendingCompletion.
+            entry.pointCount   = count;
+            entry.callback     = callback;
+            entry.positionsRef = positions;
+            entry.processed    = new java.util.concurrent.CompletableFuture<>();
+
+            cl_event readEv = new cl_event();
+            // Non-blocking write — kernel will see the data via in-order
+            // queue semantics. positions stays GC-rooted via positionsRef.
+            clEnqueueWriteBuffer(slot.queue, entry.posBuf, CL_FALSE, 0,
+                (long) Sizeof.cl_double * count * 3,
+                Pointer.to(positions), 0, null, null);
+            clEnqueueNDRangeKernel(slot.queue, k, 1, null,
+                new long[]{roundUp(count, densityLocalWorkSize)},
+                new long[]{densityLocalWorkSize}, 0, null, null);
+            // Non-blocking read into entry.hostResults (per-ring-entry,
+            // safe to write concurrent with other rings/slots). The event
+            // is what the completion thread waits on.
+            clEnqueueReadBuffer(slot.queue, entry.outBuf, CL_FALSE, 0,
+                (long) Sizeof.cl_double * count,
+                Pointer.to(entry.hostResults), 0, null, readEv);
+
+            entry.readEvent = readEv;
+            // Hand off to completion thread. After this push, the entry
+            // belongs to the completion thread until it completes the
+            // processed future.
+            pendingCompletions.add(new PendingCompletion(entry));
+            enqueued = true;
+        } finally {
+            returnSlot(slot);
+            if (!enqueued) {
+                // We borrowed the slot but failed before enqueueing.
+                // Signal CPU fallback.
+                try { callback.onFailure(new RuntimeException("dispatch aborted")); }
+                catch (Throwable ignored) {}
+            }
         }
     }
 
@@ -577,12 +957,53 @@ public final class GpuNoiseKernel {
     }
 
     public void release() {
+        // Phase 9.13 — drain in-flight async dispatches before releasing
+        // GPU resources. Stop the completion thread, then process any
+        // remaining pending completions inline so worker futures aren't
+        // orphaned.
+        completionRunning = false;
+        if (completionThread != null) {
+            try {
+                completionThread.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        // Drain anything left in the queue. The thread may have exited
+        // mid-loop with items still queued.
+        PendingCompletion leftover;
+        while ((leftover = pendingCompletions.poll()) != null) {
+            RingEntry entry = leftover.entry;
+            cl_event ev = entry.readEvent;
+            try {
+                if (ev != null) clWaitForEvents(1, new cl_event[]{ev});
+                if (entry.callback != null) {
+                    try { entry.callback.onComplete(entry.hostResults, entry.pointCount); }
+                    catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (ev != null) {
+                    try { clReleaseEvent(ev); } catch (Throwable ignored) {}
+                }
+                java.util.concurrent.CompletableFuture<Void> f = entry.processed;
+                if (f != null) f.complete(null);
+            }
+        }
+
         for (cl_kernel k : noisePool)       clReleaseKernel(k);
         for (cl_kernel k : normalNoisePool) clReleaseKernel(k);
         for (DensitySlot s : densityTreeSlotPool) {
+            // Sync path resources
             clReleaseKernel(s.kernel);
             clReleaseMemObject(s.posBuf);
             clReleaseMemObject(s.outBuf);
+            // Phase 9.13 — ring entry resources
+            for (RingEntry e : s.ring) {
+                clReleaseKernel(e.kernel);
+                clReleaseMemObject(e.posBuf);
+                clReleaseMemObject(e.outBuf);
+            }
         }
         clReleaseProgram(program);
     }

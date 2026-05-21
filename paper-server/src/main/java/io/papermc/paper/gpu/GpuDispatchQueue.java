@@ -247,17 +247,30 @@ public final class GpuDispatchQueue {
 
     /**
      * Runs on a dispatch-pool worker thread. Builds the merged position
-     * array for one kernel group, performs the GPU dispatch (which borrows
-     * a DensitySlot internally), and routes results back to each work item's
-     * future. On failure, completes each future with null so the calling
-     * worker can fall back to CPU evaluation.
+     * array for one kernel group, ENQUEUES the GPU dispatch via the async
+     * API (Phase 9.13), and returns immediately. The completion thread
+     * inside {@link GpuNoiseKernel} will invoke the callback to split
+     * merged GPU results back to per-item futures when the device finishes.
      *
-     * Per-thread reusable result buffer (Phase 9.6.C): each dispatcher
-     * thread keeps a single growable double[] for the merged GPU output,
-     * eliminating one allocation per dispatch group. Per-item slices for
-     * each work item are still allocated because they outlive this method
-     * (the consumer reads them after future.complete) — those are a
-     * separate, deeper change.
+     * On enqueue failure, completes each waiting worker's future with null
+     * so they fall back to CPU.
+     *
+     * Phase 9.13 architectural change: this method no longer blocks on
+     * clEnqueueReadBuffer. The dispatch-pool thread frees up almost
+     * immediately (~50 µs of host-side enqueue overhead per call instead
+     * of the prior ~1 ms wall). The flusher's wait-on-tasks loop now only
+     * waits for the ENQUEUE to finish, not the device-side completion —
+     * which means many more flushes per unit time and more device pipeline
+     * depth. Worker futures are completed by the completion thread inside
+     * GpuNoiseKernel rather than this method.
+     *
+     * Per-merged-position-buffer is allocated fresh each call now (vs the
+     * thread-local reuse in Phase 9.6.D), because the buffer must remain
+     * GC-rooted until the async DMA finishes — a thread-local would be
+     * overwritten by the next dispatch on the same thread before the prior
+     * device read completes. The async API holds positionsRef internally
+     * on the RingEntry, so the GC can reclaim the merged buffer once the
+     * read completes and the entry's positionsRef is cleared.
      */
     private void dispatchGroup(GpuCompiledKernel ck, List<GpuWorkItem> group) {
         // Build merged position array
@@ -266,74 +279,58 @@ public final class GpuDispatchQueue {
             w.batchOffset = totalPoints;
             totalPoints  += w.count;
         }
-
-        // Both merged buffers are thread-local. Dispatcher threads are
-        // pinned to the fixed-size pool, so reuse hit rate is ~100%.
-        // Positions buffer is 3x wider than the result buffer.
-        double[] mergedPositions = acquirePositionsBuf(totalPoints);
+        // Stack-local captured by the callback closure; must not be reused
+        // by this thread or the next dispatch until the device has read it.
+        final double[] mergedPositions = new double[totalPoints * 3];
         for (GpuWorkItem w : group) {
             System.arraycopy(w.positions, 0,
                 mergedPositions, w.batchOffset * 3, w.count * 3);
         }
 
-        double[] mergedResults = acquireResultBuf(totalPoints);
+        final int finalTotalPoints = totalPoints;
+        final List<GpuWorkItem> finalGroup = group;
+        final long enqueueStart = System.nanoTime();
 
-        // Single GPU dispatch for the whole group
+        // Async dispatch — the callback runs on the completion thread when
+        // the device's read DMA finishes. From this dispatch-pool thread's
+        // perspective, evalDensityTreeAsync returns after the (non-blocking)
+        // enqueue calls (~50-100 µs of host overhead) instead of waiting
+        // for the kernel to actually finish (~1 ms wall).
+        GpuNoiseKernel.AsyncCallback cb = new GpuNoiseKernel.AsyncCallback() {
+            @Override
+            public void onComplete(double[] hostResults, int pointCount) {
+                // The benchmark stats: device-side time is best measured by
+                // the difference between enqueue start (host) and completion
+                // (also host, at this callback). Includes both host enqueue
+                // overhead AND the device-side execution time — this is the
+                // honest "wall time" per dispatch from the consumer's POV.
+                GlassPaperBenchmark.recordGpu(
+                    System.nanoTime() - enqueueStart, pointCount);
+                GlassPaperBenchmark.recordBatchFlush(pointCount);
+                // Split per-item slices and complete worker futures
+                for (GpuWorkItem w : finalGroup) {
+                    double[] slice = new double[w.count];
+                    System.arraycopy(hostResults, w.batchOffset, slice, 0, w.count);
+                    w.future.complete(slice);
+                }
+            }
+            @Override
+            public void onFailure(Throwable cause) {
+                LOGGER.warning("GPU async dispatch failed: " + cause.getMessage());
+                for (GpuWorkItem w : finalGroup) {
+                    w.future.complete(null);
+                }
+            }
+        };
+
         try {
-            long start = System.nanoTime();
-            kernel.evalDensityTreeFast(mergedPositions, ck, totalPoints, mergedResults);
-            GlassPaperBenchmark.recordGpu(System.nanoTime() - start, totalPoints);
-            GlassPaperBenchmark.recordBatchFlush(totalPoints);
+            kernel.evalDensityTreeAsync(mergedPositions, ck, finalTotalPoints, cb);
         } catch (Exception e) {
-            LOGGER.warning("GPU batch dispatch failed: " + e.getMessage());
-            // Signal CPU fallback to each waiting worker. Zero-filling the
-            // result here would silently corrupt terrain — the caller
-            // interprets a non-null array as a successful GPU dispatch and
-            // copies it straight into the interpolator slice.
-            for (GpuWorkItem w : group) {
+            LOGGER.warning("GPU async enqueue failed: " + e.getMessage());
+            for (GpuWorkItem w : finalGroup) {
                 w.future.complete(null);
             }
-            return;
         }
-
-        // Split results back to individual futures. Per-item slices are
-        // freshly allocated because the merged buffer is about to be
-        // overwritten by this thread's next dispatch — handing it out
-        // would race the consumer's read against the next kernel run.
-        for (GpuWorkItem w : group) {
-            double[] slice = new double[w.count];
-            System.arraycopy(mergedResults, w.batchOffset, slice, 0, w.count);
-            w.future.complete(slice);
-        }
-    }
-
-    // Per-dispatch-thread reusable result + positions buffers. Dispatcher
-    // threads are pinned in a fixed-size pool, so each thread keeps a
-    // single growable buffer of each kind. Grown with 2x headroom on
-    // overflow to avoid churn from small fluctuations in batch size.
-    private static final ThreadLocal<double[]> RESULT_BUF =
-        ThreadLocal.withInitial(() -> new double[0]);
-    private static final ThreadLocal<double[]> POSITIONS_BUF =
-        ThreadLocal.withInitial(() -> new double[0]);
-
-    private static double[] acquireResultBuf(int needed) {
-        double[] buf = RESULT_BUF.get();
-        if (buf.length < needed) {
-            int grown = Math.max(needed, buf.length * 2);
-            buf = new double[grown];
-            RESULT_BUF.set(buf);
-        }
-        return buf;
-    }
-
-    private static double[] acquirePositionsBuf(int neededPoints) {
-        int neededDoubles = neededPoints * 3;
-        double[] buf = POSITIONS_BUF.get();
-        if (buf.length < neededDoubles) {
-            int grown = Math.max(neededDoubles, buf.length * 2);
-            buf = new double[grown];
-            POSITIONS_BUF.set(buf);
-        }
-        return buf;
+        // Returns immediately; dispatch thread is free for the next group.
     }
 }
