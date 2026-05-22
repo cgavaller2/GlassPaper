@@ -270,17 +270,19 @@ public final class GpuNoiseValidator {
                 blendedPassed = false;
             }
 
-            // Phase 9.14.A4 — chain the fusion-singleton diagnostic onto the
+            // Phase 9.14.A4 + A5 — chain the fusion diagnostics onto the
             // BlendedNoise validator. NOT gating: a fusion failure here would
             // not affect the current hot path (which doesn't use fusion until
             // Phase 9.14.B). We log the result; the gating return value is
             // the BlendedNoise result alone.
             try {
-                boolean fusionPassed = validateFusionSingleton(kernel);
-                if (!fusionPassed) {
+                boolean singletonPassed = validateFusionSingleton(kernel);
+                boolean multiPassed = validateFusionMulti(kernel);
+                if (!singletonPassed || !multiPassed) {
                     LOGGER.warning(
-                        "Phase 9.14 fusion-singleton validation failed — "
-                      + "kernel fusion infrastructure has a bug. GPU stays "
+                        "Phase 9.14 fusion validation failed (singleton="
+                      + singletonPassed + ", multi=" + multiPassed
+                      + ") — kernel fusion infrastructure has a bug. GPU stays "
                       + "enabled for the non-fused path; fix before wiring "
                       + "fusion into NoiseChunk.fillSliceGpu (Phase 9.14.B).");
                 }
@@ -412,6 +414,158 @@ public final class GpuNoiseValidator {
             }
         } catch (Exception e) {
             LOGGER.severe("Fusion validation exception: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * Phase 9.14.A5 — multi-kernel fusion validation. Exercises the
+     * re-indexing logic in DensityFunctionFuser by fusing TWO distinct
+     * CDFs (different RNG seeds → different noise/blended/octave data)
+     * and verifying each constituent's output slice matches the standalone
+     * non-fused dispatch of that constituent.
+     *
+     * The singleton validator passing bit-exact only proved kernel routing
+     * works — for N=1, no opcode or buffer offset is bumped. This validator
+     * exercises:
+     *   - BLENDED_NOISE opcode bumping (idx += blendedOff)
+     *   - blendedPerlinInfo octave-offset bumping
+     *   - octaveParams / permTables concatenation
+     *
+     * The BlendedNoise test tree does NOT exercise the NOISE/SHIFTED_NOISE/
+     * SPLINE_EVAL re-indexing paths. Those will get exercised when fusion
+     * is wired into the hot path in Phase 9.14.B — the runtime CPU/GPU
+     * `/gpuvalidate` will catch any divergence there.
+     */
+    public static boolean validateFusionMulti(GpuNoiseKernel kernel) {
+        LOGGER.info("Running fusion multi-kernel validation (1000 samples × 2 kernels)...");
+        try {
+            // CDF 1: BlendedNoise with seed 11111
+            net.minecraft.util.RandomSource rng1 =
+                net.minecraft.util.RandomSource.create(11111L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise bn1 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    rng1, 0.25, 0.125, 80.0, 160.0, 8.0);
+            net.minecraft.util.RandomSource dr1 =
+                net.minecraft.util.RandomSource.create(22222L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise du1a =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr1, 1.0, 1.0, 80.0, 160.0, 8.0);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise du1b =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr1, 1.0, 1.0, 80.0, 160.0, 8.0);
+            io.papermc.paper.gpu.CompiledDensityFunction cdf1 =
+                net.minecraft.world.level.levelgen.DensityFunctionCompiler
+                    .compileBlendedNoiseTestTree(bn1, du1a, du1b);
+
+            // CDF 2: BlendedNoise with seed 33333, different scales
+            net.minecraft.util.RandomSource rng2 =
+                net.minecraft.util.RandomSource.create(33333L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise bn2 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    rng2, 0.5, 0.25, 80.0, 160.0, 8.0);
+            net.minecraft.util.RandomSource dr2 =
+                net.minecraft.util.RandomSource.create(44444L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise du2a =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr2, 1.0, 1.0, 80.0, 160.0, 8.0);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise du2b =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr2, 1.0, 1.0, 80.0, 160.0, 8.0);
+            io.papermc.paper.gpu.CompiledDensityFunction cdf2 =
+                net.minecraft.world.level.levelgen.DensityFunctionCompiler
+                    .compileBlendedNoiseTestTree(bn2, du2a, du2b);
+
+            if (cdf1 == null || cdf2 == null) {
+                LOGGER.severe("Fusion multi: test compile failed");
+                return false;
+            }
+
+            // Sample positions (shared between both kernels since fused
+            // dispatch uses one position array for all constituents)
+            int count = 1000;
+            double[] positions = new double[count * 3];
+            net.minecraft.util.RandomSource posRng =
+                net.minecraft.util.RandomSource.create(88888L);
+            for (int i = 0; i < count; i++) {
+                positions[i*3]     = (int)((posRng.nextDouble() - 0.5) * 60000);
+                positions[i*3 + 1] = (int)(posRng.nextDouble() * 384) - 64;
+                positions[i*3 + 2] = (int)((posRng.nextDouble() - 0.5) * 60000);
+            }
+
+            // Reference: standalone non-fused dispatch of each CDF
+            io.papermc.paper.gpu.GpuCompiledKernel gk1 =
+                io.papermc.paper.gpu.GpuCompiledKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), cdf1);
+            double[] ref1 = kernel.evalDensityTreeFast(positions, gk1, count);
+            gk1.close();
+
+            io.papermc.paper.gpu.GpuCompiledKernel gk2 =
+                io.papermc.paper.gpu.GpuCompiledKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), cdf2);
+            double[] ref2 = kernel.evalDensityTreeFast(positions, gk2, count);
+            gk2.close();
+
+            // Fused dispatch
+            io.papermc.paper.gpu.FusedDensityFunction fdf =
+                io.papermc.paper.gpu.DensityFunctionFuser.fuse(
+                    java.util.List.of(cdf1, cdf2));
+            LOGGER.info(String.format(
+                "Fusion multi sizes: 2 kernels, iOps=%d (%d+%d), octaves=%d (%d+%d), "
+              + "blended=%d (%d+%d)",
+                fdf.flatIOps.length, cdf1.iOps.length, cdf2.iOps.length,
+                fdf.flatOctaveParams.length / 4,
+                cdf1.octaveParams.length / 4, cdf2.octaveParams.length / 4,
+                fdf.flatBlendedPerlinInfo.length / 6,
+                cdf1.blendedPerlinInfo.length / 6, cdf2.blendedPerlinInfo.length / 6));
+
+            io.papermc.paper.gpu.GpuFusedKernel gfk =
+                io.papermc.paper.gpu.GpuFusedKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), fdf);
+            // Output layout: [k0 results × count][k1 results × count]
+            double[] fusedOut = new double[2 * count];
+            kernel.evalFusedSync(positions, gfk, count, fusedOut);
+            gfk.close();
+
+            // Compare: ref1 ↔ fusedOut[0..count), ref2 ↔ fusedOut[count..2*count)
+            int failures = 0;
+            double maxDeltaK1 = 0.0, maxDeltaK2 = 0.0;
+            for (int i = 0; i < count; i++) {
+                double f1 = fusedOut[i];
+                double d1 = Math.abs(f1 - ref1[i]);
+                double f2 = fusedOut[count + i];
+                double d2 = Math.abs(f2 - ref2[i]);
+                if (d1 > maxDeltaK1) maxDeltaK1 = d1;
+                if (d2 > maxDeltaK2) maxDeltaK2 = d2;
+
+                if (d1 > 1e-3 || d2 > 1e-3) {
+                    failures++;
+                    if (failures <= 5) {
+                        LOGGER.severe(String.format(
+                            "Fusion multi MISMATCH @(%.0f,%.0f,%.0f): "
+                          + "k1 ref=%.10f fused=%.10f δ=%.3e; "
+                          + "k2 ref=%.10f fused=%.10f δ=%.3e",
+                            positions[i*3], positions[i*3+1], positions[i*3+2],
+                            ref1[i], f1, d1, ref2[i], f2, d2));
+                    }
+                }
+            }
+
+            if (failures == 0) {
+                LOGGER.info(String.format(
+                    "Fusion multi validation PASSED. max delta k1=%.3e, k2=%.3e",
+                    maxDeltaK1, maxDeltaK2));
+                return true;
+            } else {
+                LOGGER.severe(String.format(
+                    "Fusion multi validation FAILED. %d/%d mismatched, "
+                  + "max delta k1=%.3e, k2=%.3e",
+                    failures, count, maxDeltaK1, maxDeltaK2));
+                return false;
+            }
+        } catch (Exception e) {
+            LOGGER.severe("Fusion multi validation exception: " + e.getMessage());
             e.printStackTrace();
             return false;
         }
