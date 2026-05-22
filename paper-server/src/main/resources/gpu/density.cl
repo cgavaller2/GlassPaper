@@ -672,6 +672,450 @@ __kernel void evalDensityTree(
     output[id] = (sp > 0) ? stack[sp-1] : 0.0;
 }
 
+// ── Phase 9.14: __global-address-space variants of the helpers ───────────────
+//
+// OpenCL is strict about address-space qualifiers — a __constant pointer
+// cannot be passed to a parameter declared __global, and vice versa. The
+// original helpers (evalNoise, evalBlendedNoise, evalSplineD0..D3) take
+// __constant for the small hot buffers (Phase 9.6.E). The fused kernel
+// keeps everything __global because the concatenated buffers may exceed
+// NVIDIA's per-SM constant cache (~8KB on Turing — Phase 9.6.G).
+//
+// These _G variants are byte-identical to the originals except for the
+// address-space qualifiers on the formerly-__constant parameters. Kept
+// alongside the originals so evalDensityTree's Phase 9.6.E gain is
+// preserved and evalDensityTreeFused gets a working compile.
+
+static double evalNoiseG(int ni, double x, double y, double z,
+                         __global const double* noiseParams,
+                         __global const int*    noiseInfo,
+                         __global const double* octaveParams,
+                         __global const uchar*  permTables) {
+    int pb=ni*5, ib=ni*4;
+    double vf=noiseParams[pb], fiF=noiseParams[pb+1], fvF=noiseParams[pb+2],
+           siF=noiseParams[pb+3], svF=noiseParams[pb+4];
+    int foOff=noiseInfo[ib], soOff=noiseInfo[ib+1], fc=noiseInfo[ib+2], sc=noiseInfo[ib+3];
+    double fv = perlinGetValue(x,y,z,fiF,fvF,fc,foOff,octaveParams,permTables);
+    double sv = perlinGetValue(x*1.0181268882175227, y*1.0181268882175227, z*1.0181268882175227,
+                               siF,svF,sc,soOff,octaveParams,permTables);
+    return (fv+sv)*vf;
+}
+
+static double evalBlendedNoiseG(
+    int bi, double x, double y, double z,
+    __global const double* blendedScalars,
+    __global const double* blendedPerlinFactors,
+    __global const int*    blendedPerlinInfo,
+    __global const double* octaveParams,
+    __global const uchar*  permTables)
+{
+    int sb = bi * 5;
+    double xzMul  = blendedScalars[sb+0];
+    double yMul   = blendedScalars[sb+1];
+    double xzFac  = blendedScalars[sb+2];
+    double yFac   = blendedScalars[sb+3];
+    double smear  = blendedScalars[sb+4];
+
+    int fb = bi * 6;
+    double minIF  = blendedPerlinFactors[fb+0];
+    double minVF  = blendedPerlinFactors[fb+1];
+    double maxIF  = blendedPerlinFactors[fb+2];
+    double maxVF  = blendedPerlinFactors[fb+3];
+    double mainIF = blendedPerlinFactors[fb+4];
+    double mainVF = blendedPerlinFactors[fb+5];
+
+    int ib = bi * 6;
+    int minOff   = blendedPerlinInfo[ib+0];
+    int maxOff   = blendedPerlinInfo[ib+1];
+    int mainOff  = blendedPerlinInfo[ib+2];
+    int minCnt   = blendedPerlinInfo[ib+3];
+    int maxCnt   = blendedPerlinInfo[ib+4];
+    int mainCnt  = blendedPerlinInfo[ib+5];
+
+    double d  = x * xzMul;
+    double d1 = y * yMul;
+    double d2 = z * xzMul;
+    double d3 = d  / xzFac;
+    double d4 = d1 / yFac;
+    double d5 = d2 / xzFac;
+    double d6 = yMul * smear;
+    double d7 = d6  / yFac;
+
+    double d10 = 0.0;
+    double scale = 1.0;
+    for (int i = 0; i < 8 && i < mainCnt; i++) {
+            int pb = (mainOff + (mainCnt - 1 - i)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(mainOff + (mainCnt - 1 - i)) * 256;
+            double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+            d10 += improvedNoiseYScale(
+                wrapNoise(d3 * scale), wrapNoise(d4 * scale), wrapNoise(d5 * scale),
+                xo, yo, zo,
+                d7 * scale, d4 * scale, pt) / scale;
+        }
+        scale /= 2.0;
+    }
+
+    double d12 = (d10 / 10.0 + 1.0) / 2.0;
+    d12 = clamp(d12, 0.0, 1.0);
+    int flag1 = (d12 >= 1.0) ? 1 : 0;
+    int flag2 = (d12 <= 0.0) ? 1 : 0;
+
+    double d8 = 0.0, d9 = 0.0;
+    scale = 1.0;
+    for (int i1 = 0; i1 < 16 && (i1 < minCnt || i1 < maxCnt); i1++) {
+        double d13 = wrapNoise(d  * scale);
+        double d14 = wrapNoise(d1 * scale);
+        double d15 = wrapNoise(d2 * scale);
+        double d16 = d6 * scale;
+
+        if (!flag1 && i1 < minCnt) {
+            int pb = (minOff + (minCnt - 1 - i1)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(minOff + (minCnt - 1 - i1)) * 256;
+                double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+                d8 += improvedNoiseYScale(d13, d14, d15, xo, yo, zo,
+                    d16, d1 * scale, pt) / scale;
+            }
+        }
+        if (!flag2 && i1 < maxCnt) {
+            int pb = (maxOff + (maxCnt - 1 - i1)) * 4;
+            double amp = octaveParams[pb];
+            if (amp != 0.0) {
+                __global const uchar* pt = permTables + (long)(maxOff + (maxCnt - 1 - i1)) * 256;
+                double xo = octaveParams[pb+1], yo = octaveParams[pb+2], zo = octaveParams[pb+3];
+                d9 += improvedNoiseYScale(d13, d14, d15, xo, yo, zo,
+                    d16, d1 * scale, pt) / scale;
+            }
+        }
+        scale /= 2.0;
+    }
+
+    double lo = d8 / 512.0;
+    double hi = d9 / 512.0;
+    double result;
+    if (d12 <= 0.0) result = lo;
+    else if (d12 >= 1.0) result = hi;
+    else result = lo + d12 * (hi - lo);
+    return result / 128.0;
+}
+
+// Forward declarations for the global-spline variants (recursive)
+static float evalSplineD0G(int idx, float c0,
+    __global const int* sh, __global const float* fp, __global const int* ci);
+static float evalSplineD1G(int idx, float c0, float c1,
+    __global const int* sh, __global const float* fp, __global const int* ci);
+static float evalSplineD2G(int idx, float c0, float c1, float c2,
+    __global const int* sh, __global const float* fp, __global const int* ci);
+static float evalSplineD3G(int idx, float c0, float c1, float c2, float c3,
+    __global const int* sh, __global const float* fp, __global const int* ci);
+
+static float evalSplineD0G(int idx, float c0,
+    __global const int* sh, __global const float* fp, __global const int* ci)
+{
+    int b = idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
+    if (type == 0) return fp[fpS];
+    if (type == 1) {
+        int vS = sh[b+3];
+        int lo = findKnot(c0, K, fpS, fp);
+        if (lo < 0)   return fp[vS]       + fp[fpS+K]       * (c0 - fp[fpS]);
+        if (lo >= K-1) return fp[vS+K-1]  + fp[fpS+2*K-1]  * (c0 - fp[fpS+K-1]);
+        return hermiteInterp(c0, lo, K, fpS, fp[vS+lo], fp[vS+lo+1], fp);
+    }
+    return 0.0f;
+}
+
+static float evalSplineD1G(int idx, float c0, float c1,
+    __global const int* sh, __global const float* fp, __global const int* ci)
+{
+    int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
+    if (type == 0) return fp[fpS];
+    if (type == 1) {
+        int vS = sh[b+3];
+        int lo = findKnot(c0, K, fpS, fp);
+        if (lo < 0)    return fp[vS]      + fp[fpS+K]      * (c0 - fp[fpS]);
+        if (lo >= K-1) return fp[vS+K-1]  + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+        return hermiteInterp(c0, lo, K, fpS, fp[vS+lo], fp[vS+lo+1], fp);
+    }
+    int csS = sh[b+3];
+    int lo  = findKnot(c0, K, fpS, fp);
+    float vLo, vHi;
+    if (lo < 0) {
+        vLo = evalSplineD0G(ci[csS], c1, sh, fp, ci);
+        return vLo + fp[fpS+K] * (c0 - fp[fpS]);
+    }
+    if (lo >= K-1) {
+        vLo = evalSplineD0G(ci[csS+K-1], c1, sh, fp, ci);
+        return vLo + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+    }
+    vLo = evalSplineD0G(ci[csS+lo],   c1, sh, fp, ci);
+    vHi = evalSplineD0G(ci[csS+lo+1], c1, sh, fp, ci);
+    return hermiteInterp(c0, lo, K, fpS, vLo, vHi, fp);
+}
+
+static float evalSplineD2G(int idx, float c0, float c1, float c2,
+    __global const int* sh, __global const float* fp, __global const int* ci)
+{
+    int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
+    if (type == 0) return fp[fpS];
+    if (type == 1) {
+        int vS = sh[b+3];
+        int lo = findKnot(c0, K, fpS, fp);
+        if (lo < 0)    return fp[vS]      + fp[fpS+K]      * (c0 - fp[fpS]);
+        if (lo >= K-1) return fp[vS+K-1]  + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+        return hermiteInterp(c0, lo, K, fpS, fp[vS+lo], fp[vS+lo+1], fp);
+    }
+    int csS = sh[b+3];
+    int lo  = findKnot(c0, K, fpS, fp);
+    float vLo, vHi;
+    if (lo < 0) {
+        vLo = evalSplineD1G(ci[csS], c1, c2, sh, fp, ci);
+        return vLo + fp[fpS+K] * (c0 - fp[fpS]);
+    }
+    if (lo >= K-1) {
+        vLo = evalSplineD1G(ci[csS+K-1], c1, c2, sh, fp, ci);
+        return vLo + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+    }
+    vLo = evalSplineD1G(ci[csS+lo],   c1, c2, sh, fp, ci);
+    vHi = evalSplineD1G(ci[csS+lo+1], c1, c2, sh, fp, ci);
+    return hermiteInterp(c0, lo, K, fpS, vLo, vHi, fp);
+}
+
+static float evalSplineD3G(int idx, float c0, float c1, float c2, float c3,
+    __global const int* sh, __global const float* fp, __global const int* ci)
+{
+    int b=idx*4, type=sh[b], K=sh[b+1], fpS=sh[b+2];
+    if (type == 0) return fp[fpS];
+    if (type == 1) {
+        int vS = sh[b+3];
+        int lo = findKnot(c0, K, fpS, fp);
+        if (lo < 0)    return fp[vS]      + fp[fpS+K]      * (c0 - fp[fpS]);
+        if (lo >= K-1) return fp[vS+K-1]  + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+        return hermiteInterp(c0, lo, K, fpS, fp[vS+lo], fp[vS+lo+1], fp);
+    }
+    int csS = sh[b+3];
+    int lo  = findKnot(c0, K, fpS, fp);
+    float vLo, vHi;
+    if (lo < 0) {
+        vLo = evalSplineD2G(ci[csS], c1, c2, c3, sh, fp, ci);
+        return vLo + fp[fpS+K] * (c0 - fp[fpS]);
+    }
+    if (lo >= K-1) {
+        vLo = evalSplineD2G(ci[csS+K-1], c1, c2, c3, sh, fp, ci);
+        return vLo + fp[fpS+2*K-1] * (c0 - fp[fpS+K-1]);
+    }
+    vLo = evalSplineD2G(ci[csS+lo],   c1, c2, c3, sh, fp, ci);
+    vHi = evalSplineD2G(ci[csS+lo+1], c1, c2, c3, sh, fp, ci);
+    return hermiteInterp(c0, lo, K, fpS, vLo, vHi, fp);
+}
+
+// ── Phase 9.14: fused multi-density-tree kernel ──────────────────────────────
+//
+// Evaluates N density-function trees in a single GPU dispatch. The host-side
+// DensityFunctionFuser concatenates N CompiledDensityFunctions into one
+// FusedDensityFunction, re-indexing every opcode that carries a static-buffer
+// index (NOISE/SHIFTED_NOISE/SHIFT_B_NOISE/WEIRD_SCALED_SAMPLER, SPLINE_EVAL,
+// BLENDED_NOISE) plus internal references in noiseInfo (octave offsets),
+// splineHeaders (fpStart, extra), splineChildren (header indices), and
+// blendedPerlinInfo (octave offsets). So this kernel doesn't need to apply
+// offsets at runtime — it just reads the flat buffers as if they were one
+// contiguous program.
+//
+// Work-item layout: numKernels × pointCount.
+//   kernelIdx = global_id / pointCount
+//   pointIdx  = global_id - kernelIdx * pointCount
+//   output[kernelIdx * pointCount + pointIdx] = density value
+//
+// The host then splits output[0..pointCount), output[pointCount..2*pointCount),
+// ... back to per-constituent slices.
+//
+// Bytecode for each constituent starts at flatIOps[iOpStart[kernelIdx]] and
+// runs until OP_HALT. dArg cursor starts at dArgStart[kernelIdx].
+//
+// __constant qualifiers from Phase 9.6.E are NOT applied here because the
+// concatenated buffers may exceed NVIDIA's per-SM constant cache (~8KB on
+// Turing — Phase 9.6.G showed exceeding it caused a cache thrashing regression).
+// Keep everything __global for now; revisit if profiling shows constant
+// memory could help.
+__kernel void evalDensityTreeFused(
+    __global   const double* positions,
+    __global   const int*    iOpStart,         // [numKernels+1]
+    __global   const int*    dArgStart,        // [numKernels+1]
+    __global   const int*    flatIOps,
+    __global   const double* flatDArgs,
+    __global   const double* flatNoiseParams,
+    __global   const int*    flatNoiseInfo,
+    __global   const double* flatOctaveParams,
+    __global   const uchar*  flatPermTables,
+    __global   const int*    flatSplineHeaders,
+    __global   const float*  flatSplineFloatPool,
+    __global   const int*    flatSplineChildren,
+    __global   const double* flatBlendedScalars,
+    __global   const double* flatBlendedPerlinFactors,
+    __global   const int*    flatBlendedPerlinInfo,
+    __global         double* output,           // numKernels * pointCount
+    int numKernels,
+    int pointCount)
+{
+    int gid = get_global_id(0);
+    int kernelIdx = gid / pointCount;
+    int pointIdx  = gid - kernelIdx * pointCount;
+    if (kernelIdx >= numKernels) return;
+
+    // Same positions are shared across all fused kernels (they evaluate
+    // density at the same chunk-slice cell corners).
+    double x = positions[pointIdx * 3 + 0];
+    double y = positions[pointIdx * 3 + 1];
+    double z = positions[pointIdx * 3 + 2];
+
+    double stack[STACK_SIZE];
+    double scratch[SCRATCH_SIZE];
+    int sp = 0;
+    int ip = iOpStart[kernelIdx];
+    int dp = dArgStart[kernelIdx];
+
+    // VM body — identical to evalDensityTree's switch, just operates on
+    // the flat* buffers. Static-buffer indices in opcodes were pre-bumped
+    // by the host-side fuser, so noise/spline/blended lookups use absolute
+    // indices into the flat arrays.
+    for (int iter = 0; iter < MAX_ITERS; iter++) {
+        int op = flatIOps[ip++];
+
+        if (op == OP_HALT) break;
+
+        switch (op) {
+        case OP_PUSH_CONST: stack[sp++] = flatDArgs[dp++]; break;
+        case OP_PUSH_X:     stack[sp++] = x; break;
+        case OP_PUSH_Y:     stack[sp++] = y; break;
+        case OP_PUSH_Z:     stack[sp++] = z; break;
+
+        case OP_ADD: { double b=stack[--sp]; stack[sp-1]+=b; break; }
+        case OP_MUL: { double b=stack[--sp]; stack[sp-1]*=b; break; }
+        case OP_MIN_OP: { double b=stack[--sp]; stack[sp-1]=fmin(stack[sp-1],b); break; }
+        case OP_MAX_OP: { double b=stack[--sp]; stack[sp-1]=fmax(stack[sp-1],b); break; }
+
+        case OP_ADD_CONST: stack[sp-1] += flatDArgs[dp++]; break;
+        case OP_MUL_CONST: stack[sp-1] *= flatDArgs[dp++]; break;
+
+        case OP_ABS:              stack[sp-1]=fabs(stack[sp-1]); break;
+        case OP_SQUARE:         { double v=stack[sp-1]; stack[sp-1]=v*v; break; }
+        case OP_CUBE:           { double v=stack[sp-1]; stack[sp-1]=v*v*v; break; }
+        case OP_HALF_NEGATIVE:  { double v=stack[sp-1]; stack[sp-1]= v>0.0?v:v*0.5; break; }
+        case OP_QUARTER_NEGATIVE:{double v=stack[sp-1]; stack[sp-1]= v>0.0?v:v*0.25;break; }
+        case OP_SQUEEZE: {
+            double v=clamp(stack[sp-1],-1.0,1.0);
+            stack[sp-1]=v/2.0-v*v*v/24.0; break;
+        }
+        case OP_INVERT: stack[sp-1]=1.0/stack[sp-1]; break;
+
+        case OP_CLAMP: {
+            double mn=flatDArgs[dp++], mx=flatDArgs[dp++];
+            stack[sp-1]=clamp(stack[sp-1],mn,mx); break;
+        }
+
+        case OP_NOISE: {
+            int ni=(int)flatIOps[ip++];
+            double xzS=flatDArgs[dp++], yS=flatDArgs[dp++];
+            stack[sp++]=evalNoiseG(ni,x*xzS,y*yS,z*xzS,
+                flatNoiseParams,flatNoiseInfo,flatOctaveParams,flatPermTables);
+            break;
+        }
+
+        case OP_SHIFTED_NOISE: {
+            int ni=(int)flatIOps[ip++];
+            double xzS=flatDArgs[dp++], yS=flatDArgs[dp++];
+            double sz=stack[--sp], sy=stack[--sp], sx=stack[--sp];
+            stack[sp++]=evalNoiseG(ni,x*xzS+sx,y*yS+sy,z*xzS+sz,
+                flatNoiseParams,flatNoiseInfo,flatOctaveParams,flatPermTables);
+            break;
+        }
+
+        case OP_SHIFT_B_NOISE: {
+            int ni=(int)flatIOps[ip++];
+            double xzS=flatDArgs[dp++];
+            double sz=stack[--sp], sy=stack[--sp], sx=stack[--sp];
+            stack[sp++]=evalNoiseG(ni, z*xzS+sx, x*xzS+sy, 0.0+sz,
+                flatNoiseParams,flatNoiseInfo,flatOctaveParams,flatPermTables);
+            break;
+        }
+
+        case OP_BLENDED_NOISE: {
+            int bi = flatIOps[ip++];
+            if (sp >= STACK_SIZE) { output[kernelIdx * pointCount + pointIdx] = 0.0; return; }
+            stack[sp++] = evalBlendedNoiseG(bi, x, y, z,
+                flatBlendedScalars, flatBlendedPerlinFactors, flatBlendedPerlinInfo,
+                flatOctaveParams, flatPermTables);
+            break;
+        }
+
+        case OP_WEIRD_SCALED_SAMPLER: {
+            int ni         = flatIOps[ip++];
+            int mapperType = flatIOps[ip++];
+            double input   = stack[--sp];
+            double d = (mapperType == 0)
+                ? getSpaghettiRarity3D(input)
+                : getSphaghettiRarity2D(input);
+            double nx = evalNoiseG(ni, x/d, y/d, z/d,
+                flatNoiseParams, flatNoiseInfo, flatOctaveParams, flatPermTables);
+            stack[sp++] = d * fabs(nx);
+            break;
+        }
+
+        case OP_Y_GRADIENT: {
+            int fy=flatIOps[ip++], ty=flatIOps[ip++];
+            double fv=flatDArgs[dp++], tv=flatDArgs[dp++];
+            double t=clamp((y-(double)fy)/((double)ty-(double)fy),0.0,1.0);
+            stack[sp++]=fv+t*(tv-fv); break;
+        }
+
+        case OP_RANGE_SELECT: {
+            double mn=flatDArgs[dp++], mx=flatDArgs[dp++];
+            double outR=stack[--sp], inR=stack[--sp], inp=stack[--sp];
+            stack[sp++]=(inp>=mn && inp<mx) ? inR : outR; break;
+        }
+
+        case OP_BLEND_DENSITY_NOOP:
+            break;
+
+        case OP_STORE_SCRATCH: {
+            int idx = flatIOps[ip++];
+            scratch[idx] = stack[sp - 1];
+            break;
+        }
+
+        case OP_LOAD_SCRATCH: {
+            int idx = flatIOps[ip++];
+            stack[sp++] = scratch[idx];
+            break;
+        }
+
+        case OP_SPLINE_EVAL: {
+            int si    = flatIOps[ip++];
+            int depth = flatIOps[ip++];
+
+            float c0 = (depth >= 1) ? (float)stack[--sp] : 0.0f;
+            float c1 = (depth >= 2) ? (float)stack[--sp] : 0.0f;
+            float c2 = (depth >= 3) ? (float)stack[--sp] : 0.0f;
+            float c3 = (depth >= 4) ? (float)stack[--sp] : 0.0f;
+            for (int extra = 4; extra < depth; extra++) --sp;
+
+            float r;
+            if      (depth <= 1) r = evalSplineD0G(si, c0, flatSplineHeaders, flatSplineFloatPool, flatSplineChildren);
+            else if (depth == 2) r = evalSplineD1G(si, c0, c1, flatSplineHeaders, flatSplineFloatPool, flatSplineChildren);
+            else if (depth == 3) r = evalSplineD2G(si, c0, c1, c2, flatSplineHeaders, flatSplineFloatPool, flatSplineChildren);
+            else                 r = evalSplineD3G(si, c0, c1, c2, c3, flatSplineHeaders, flatSplineFloatPool, flatSplineChildren);
+
+            stack[sp++] = (double)r;
+            break;
+        }
+        } // switch
+    } // for iter
+
+    output[kernelIdx * pointCount + pointIdx] = (sp > 0) ? stack[sp-1] : 0.0;
+}
+
 // ── Original single-octave kernel (kept for validation) ──────────────────────
 __kernel void sampleNoise(
     __global const double* positions, __global const uchar* perm,

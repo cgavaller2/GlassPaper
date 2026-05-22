@@ -776,6 +776,80 @@ public final class GpuNoiseKernel {
     }
 
     /**
+     * Phase 9.14 — synchronous dispatch of a fused multi-kernel evaluation.
+     *
+     * This is the cold-path entry used by the startup correctness validator
+     * to confirm the fusion infrastructure produces output equivalent to
+     * non-fused dispatch. The hot path will use evalFusedAsync (Phase 9.14.B)
+     * which engages the ring + completion thread.
+     *
+     * Allocates fresh cl_kernel, posBuf, and outBuf per call — these aren't
+     * pre-pooled because validation runs once at startup. The outBuf must be
+     * sized numKernels × pointCount doubles since the fused kernel writes
+     * one density value per (kernelIdx, pointIdx) pair.
+     *
+     * Output layout: results[k * pointCount + p] = kernel k's value at point p.
+     * The caller is responsible for slicing this multi-output back into per-
+     * constituent slices.
+     */
+    public void evalFusedSync(double[] positions,
+                              GpuFusedKernel fk,
+                              int pointCount,
+                              double[] outResults) {
+        int numKernels = fk.numKernels;
+        long outLen = (long) numKernels * pointCount;
+        if (outResults.length < outLen) {
+            throw new IllegalArgumentException(
+                "outResults too small for fused: need " + outLen
+              + " (numKernels=" + numKernels + " × pointCount=" + pointCount
+              + "), got " + outResults.length);
+        }
+
+        cl_kernel fusedKernel = clCreateKernel(program, "evalDensityTreeFused", null);
+        cl_mem posBuf = clCreateBuffer(ctx.context(),
+            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            (long) Sizeof.cl_double * pointCount * 3,
+            Pointer.to(positions), null);
+        cl_mem outBuf = clCreateBuffer(ctx.context(),
+            CL_MEM_WRITE_ONLY,
+            (long) Sizeof.cl_double * outLen, null, null);
+
+        try {
+            clSetKernelArg(fusedKernel,  0, Sizeof.cl_mem, Pointer.to(posBuf));
+            clSetKernelArg(fusedKernel,  1, Sizeof.cl_mem, Pointer.to(fk.iOpStartBuf));
+            clSetKernelArg(fusedKernel,  2, Sizeof.cl_mem, Pointer.to(fk.dArgStartBuf));
+            clSetKernelArg(fusedKernel,  3, Sizeof.cl_mem, Pointer.to(fk.flatIOpsBuf));
+            clSetKernelArg(fusedKernel,  4, Sizeof.cl_mem, Pointer.to(fk.flatDArgsBuf));
+            clSetKernelArg(fusedKernel,  5, Sizeof.cl_mem, Pointer.to(fk.flatNoiseParamsBuf));
+            clSetKernelArg(fusedKernel,  6, Sizeof.cl_mem, Pointer.to(fk.flatNoiseInfoBuf));
+            clSetKernelArg(fusedKernel,  7, Sizeof.cl_mem, Pointer.to(fk.flatOctaveParamsBuf));
+            clSetKernelArg(fusedKernel,  8, Sizeof.cl_mem, Pointer.to(fk.flatPermTablesBuf));
+            clSetKernelArg(fusedKernel,  9, Sizeof.cl_mem, Pointer.to(fk.flatSplineHeadersBuf));
+            clSetKernelArg(fusedKernel, 10, Sizeof.cl_mem, Pointer.to(fk.flatSplineFloatPoolBuf));
+            clSetKernelArg(fusedKernel, 11, Sizeof.cl_mem, Pointer.to(fk.flatSplineChildrenBuf));
+            clSetKernelArg(fusedKernel, 12, Sizeof.cl_mem, Pointer.to(fk.flatBlendedScalarsBuf));
+            clSetKernelArg(fusedKernel, 13, Sizeof.cl_mem, Pointer.to(fk.flatBlendedPerlinFactorsBuf));
+            clSetKernelArg(fusedKernel, 14, Sizeof.cl_mem, Pointer.to(fk.flatBlendedPerlinInfoBuf));
+            clSetKernelArg(fusedKernel, 15, Sizeof.cl_mem, Pointer.to(outBuf));
+            clSetKernelArg(fusedKernel, 16, Sizeof.cl_int, Pointer.to(new int[]{numKernels}));
+            clSetKernelArg(fusedKernel, 17, Sizeof.cl_int, Pointer.to(new int[]{pointCount}));
+
+            // Validator queue (cold path, lifetime-of-server, no profiling)
+            synchronized (ctx.queue()) {
+                clEnqueueNDRangeKernel(ctx.queue(), fusedKernel, 1, null,
+                    new long[]{roundUp((int) outLen, densityLocalWorkSize)},
+                    new long[]{densityLocalWorkSize}, 0, null, null);
+                clEnqueueReadBuffer(ctx.queue(), outBuf, CL_TRUE, 0,
+                    (long) Sizeof.cl_double * outLen, Pointer.to(outResults), 0, null, null);
+            }
+        } finally {
+            clReleaseMemObject(posBuf);
+            clReleaseMemObject(outBuf);
+            clReleaseKernel(fusedKernel);
+        }
+    }
+
+    /**
      * Hot path. Borrows a pre-allocated (kernel, posBuf, outBuf) slot, uploads
      * the position array via a blocking write, dispatches the kernel, then
      * blocking-reads the results. Slot buffers are sized for MAX_POOLED_POINTS

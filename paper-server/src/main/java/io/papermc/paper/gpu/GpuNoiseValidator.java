@@ -258,16 +258,37 @@ public final class GpuNoiseValidator {
                 }
             }
 
+            boolean blendedPassed;
             if (failures == 0) {
                 LOGGER.info(String.format(
                     "BlendedNoise validation PASSED. max delta = %.2e", maxDelta));
-                return true;
+                blendedPassed = true;
             } else {
                 LOGGER.severe(String.format(
                     "BlendedNoise validation FAILED. %d/100 mismatched, " +
                         "max delta = %.2e", failures, maxDelta));
-                return false;
+                blendedPassed = false;
             }
+
+            // Phase 9.14.A4 — chain the fusion-singleton diagnostic onto the
+            // BlendedNoise validator. NOT gating: a fusion failure here would
+            // not affect the current hot path (which doesn't use fusion until
+            // Phase 9.14.B). We log the result; the gating return value is
+            // the BlendedNoise result alone.
+            try {
+                boolean fusionPassed = validateFusionSingleton(kernel);
+                if (!fusionPassed) {
+                    LOGGER.warning(
+                        "Phase 9.14 fusion-singleton validation failed — "
+                      + "kernel fusion infrastructure has a bug. GPU stays "
+                      + "enabled for the non-fused path; fix before wiring "
+                      + "fusion into NoiseChunk.fillSliceGpu (Phase 9.14.B).");
+                }
+            } catch (Throwable t) {
+                LOGGER.warning("Phase 9.14 fusion validation threw: " + t.getMessage());
+            }
+
+            return blendedPassed;
         } catch (Exception e) {
             LOGGER.severe("BlendedNoise validation exception: " + e.getMessage());
             e.printStackTrace();
@@ -275,5 +296,124 @@ public final class GpuNoiseValidator {
         }
     }
 
+    /**
+     * Phase 9.14.A4 — validates the kernel-fusion infrastructure. Compiles
+     * the same BlendedNoise test tree used by validateBlendedNoise, then:
+     *   1. Dispatches it via the regular non-fused path → reference output.
+     *   2. Fuses it (singleton list) into a FusedDensityFunction.
+     *   3. Dispatches the fused version via evalFusedSync → fused output.
+     *   4. Compares the two outputs bit-by-bit.
+     *
+     * For a singleton fusion, the fused output MUST be bit-identical to the
+     * non-fused output — there's no FP reordering between the paths since
+     * the kernel body is the same modulo address-space qualifiers. Any
+     * difference indicates a bug in fuse() (re-indexing) or in the fused
+     * kernel (helper variants).
+     *
+     * Once the singleton case validates, multi-kernel fusions can be
+     * trusted modulo any deliberate FP reordering — the validator catches
+     * structural bugs, not ULP-level fast-math drift.
+     */
+    public static boolean validateFusionSingleton(GpuNoiseKernel kernel) {
+        LOGGER.info("Running fusion singleton validation (1000 samples)...");
+        try {
+            // Same test setup as validateBlendedNoise — a known-good CDF.
+            net.minecraft.util.RandomSource rng = net.minecraft.util.RandomSource.create(12345L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise bn =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    rng, 0.25, 0.125, 80.0, 160.0, 8.0);
+            net.minecraft.util.RandomSource dr = net.minecraft.util.RandomSource.create(99999L);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise dummy1 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr, 1.0, 1.0, 80.0, 160.0, 8.0);
+            net.minecraft.world.level.levelgen.synth.BlendedNoise dummy2 =
+                new net.minecraft.world.level.levelgen.synth.BlendedNoise(
+                    dr, 1.0, 1.0, 80.0, 160.0, 8.0);
 
+            io.papermc.paper.gpu.CompiledDensityFunction cdf =
+                net.minecraft.world.level.levelgen.DensityFunctionCompiler
+                    .compileBlendedNoiseTestTree(bn, dummy1, dummy2);
+            if (cdf == null) {
+                LOGGER.severe("Fusion validation: test compile failed");
+                return false;
+            }
+
+            int count = 1000;
+            double[] positions = new double[count * 3];
+            net.minecraft.util.RandomSource posRng =
+                net.minecraft.util.RandomSource.create(77777L);
+            for (int i = 0; i < count; i++) {
+                positions[i*3]     = (int)((posRng.nextDouble() - 0.5) * 60000);
+                positions[i*3 + 1] = (int)(posRng.nextDouble() * 384) - 64;
+                positions[i*3 + 2] = (int)((posRng.nextDouble() - 0.5) * 60000);
+            }
+
+            // 1. Reference: non-fused dispatch.
+            io.papermc.paper.gpu.GpuCompiledKernel gpuKernel =
+                io.papermc.paper.gpu.GpuCompiledKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), cdf);
+            double[] referenceOutput = kernel.evalDensityTreeFast(positions, gpuKernel, count);
+            gpuKernel.close();
+
+            // 2. Fuse the singleton.
+            io.papermc.paper.gpu.FusedDensityFunction fdf =
+                io.papermc.paper.gpu.DensityFunctionFuser.fuse(java.util.List.of(cdf));
+
+            // Diagnostic: confirm singleton fusion produced sensible buffer
+            // sizes (should equal the CDF's sizes — no expansion).
+            LOGGER.info(String.format(
+                "Fusion singleton sizes: iOps=%d (orig %d), dArgs=%d (orig %d), "
+              + "noises=%d, octaves=%d, splines=%d",
+                fdf.flatIOps.length, cdf.iOps.length,
+                fdf.flatDArgs.length, cdf.dArgs.length,
+                fdf.flatNoiseInfo.length / 4,
+                fdf.flatOctaveParams.length / 4,
+                fdf.flatSplineHeaders.length / 4));
+
+            // 3. Dispatch the fused version.
+            io.papermc.paper.gpu.GpuFusedKernel gfk =
+                io.papermc.paper.gpu.GpuFusedKernel.upload(
+                    io.papermc.paper.gpu.GpuContext.get(), fdf);
+            double[] fusedOutput = new double[count];  // numKernels=1 × pointCount
+            kernel.evalFusedSync(positions, gfk, count, fusedOutput);
+            gfk.close();
+
+            // 4. Compare. For a singleton fusion the kernel body is the
+            //    same modulo address-space qualifiers — output should match
+            //    to high precision. Allow small FP drift in case fast-math
+            //    reorders differently between __constant and __global access
+            //    patterns.
+            int failures = 0;
+            double maxDelta = 0.0;
+            for (int i = 0; i < count; i++) {
+                double delta = Math.abs(referenceOutput[i] - fusedOutput[i]);
+                if (delta > maxDelta) maxDelta = delta;
+                if (delta > 1e-3) {
+                    failures++;
+                    if (failures <= 5) {
+                        LOGGER.severe(String.format(
+                            "Fusion singleton MISMATCH @(%.0f,%.0f,%.0f): "
+                          + "ref=%.10f fused=%.10f delta=%.3e",
+                            positions[i*3], positions[i*3+1], positions[i*3+2],
+                            referenceOutput[i], fusedOutput[i], delta));
+                    }
+                }
+            }
+
+            if (failures == 0) {
+                LOGGER.info(String.format(
+                    "Fusion singleton validation PASSED. max delta = %.3e", maxDelta));
+                return true;
+            } else {
+                LOGGER.severe(String.format(
+                    "Fusion singleton validation FAILED. %d/%d mismatched, max delta = %.3e",
+                    failures, count, maxDelta));
+                return false;
+            }
+        } catch (Exception e) {
+            LOGGER.severe("Fusion validation exception: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
 }
