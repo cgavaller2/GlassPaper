@@ -103,21 +103,13 @@ public final class GpuDispatchQueue {
     public GpuWorkItem submitAsync(double[] positions, GpuCompiledKernel gpuKernel, int count) {
         GpuWorkItem item = new GpuWorkItem(positions, gpuKernel, count);
         pendingQueue.add(item);
-        pendingPoints.addAndGet(count);
+        int total = pendingPoints.addAndGet(count);
 
-        // Phase 9.13.B — always notify the flusher on submit. Previously
-        // we only notified when pendingPoints crossed the threshold, on
-        // the theory that the threshold-or-interval wait was the cycle
-        // pacer. With async dispatch (Phase 9.13) the dispatch path no
-        // longer blocks, so the flusher can cycle much faster than 1/ms.
-        // Notifying on every submit lets it pick up work the moment it
-        // arrives. The flusherLoop also now skips its 1ms interval wait
-        // entirely when pendingPoints > 0, so the actual flush cadence
-        // becomes bounded by enqueue time (~100 µs) rather than the
-        // interval. This drives ring depth utilization up from ~12% (one
-        // wave per ms × 5 dispatches) to whatever the workers can sustain.
-        synchronized (flusherThread) {
-            flusherThread.notifyAll();
+        // Wake flusher immediately if threshold reached
+        if (total >= flushThreshold) {
+            synchronized (flusherThread) {
+                flusherThread.notifyAll();
+            }
         }
         return item;
     }
@@ -183,26 +175,9 @@ public final class GpuDispatchQueue {
 
     private void flusherLoop() {
         while (running) {
-            // Phase 9.13.B — only wait when there is genuinely no work.
-            // Previously we waited up to flushIntervalMs (1ms) whenever
-            // pendingPoints was below threshold, which pinned flush rate
-            // to ~1/ms even when work was constantly available. With
-            // async dispatch the flush itself is cheap (~100 µs to enqueue
-            // 5 dispatches into the rings), so we should flush whenever
-            // there's anything to flush.
-            //
-            // The wait condition is now "queue empty" — pendingPoints == 0
-            // is the only state where waiting helps (no work to flush).
-            // If pendingPoints > 0, skip wait, go flush. After flush(),
-            // loop back; if more work has arrived (or completion thread
-            // unblocked workers who submitted more), we flush immediately
-            // without waiting.
-            //
-            // The flushIntervalMs is kept as the wait timeout so we still
-            // wake periodically to check `running` and handle shutdown
-            // cleanly even with no submit-side notify firing.
+            // Wait until threshold reached or interval elapsed
             synchronized (flusherThread) {
-                if (pendingPoints.get() == 0) {
+                if (pendingPoints.get() < flushThreshold) {
                     try {
                         flusherThread.wait(flushIntervalMs);
                     } catch (InterruptedException ignored) {}
