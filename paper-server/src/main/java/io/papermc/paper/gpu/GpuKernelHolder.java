@@ -34,6 +34,75 @@ public final class GpuKernelHolder {
     private static final Map<net.minecraft.world.level.levelgen.DensityFunction, Object>
         identityCache = java.util.Collections.synchronizedMap(new WeakHashMap<>());
 
+    // Phase 9.14.B — fused kernel cache. Keyed by the ordered list of
+    // constituent GpuCompiledKernel identities. Vanilla MC reuses the same
+    // interpolators (and therefore the same compiled kernel instances)
+    // across all chunks in a world, so the hit rate should approach 100%
+    // once warmed up. A miss requires running DensityFunctionFuser.fuse
+    // (~ms) plus the GPU upload of the concatenated buffers (~ms).
+    private static final ConcurrentHashMap<FusedKey, GpuFusedKernel>
+        fusedKernelCache = new ConcurrentHashMap<>();
+
+    /** Compound key — array of constituent kernel identities, equality by ==. */
+    private static final class FusedKey {
+        final GpuCompiledKernel[] kernels;
+        final int hash;
+        FusedKey(java.util.List<GpuCompiledKernel> ks) {
+            this.kernels = ks.toArray(new GpuCompiledKernel[0]);
+            int h = 1;
+            for (GpuCompiledKernel k : kernels) {
+                h = 31 * h + System.identityHashCode(k);
+            }
+            this.hash = h;
+        }
+        @Override public int hashCode() { return hash; }
+        @Override public boolean equals(Object o) {
+            if (!(o instanceof FusedKey)) return false;
+            FusedKey other = (FusedKey) o;
+            if (this.kernels.length != other.kernels.length) return false;
+            for (int i = 0; i < kernels.length; i++) {
+                if (kernels[i] != other.kernels[i]) return false;
+            }
+            return true;
+        }
+    }
+
+    /**
+     * Phase 9.14.B — look up (or create + cache) the fused-dispatch kernel
+     * for a given ordered sequence of constituent GpuCompiledKernels.
+     *
+     * The caller passes the same ORDER each time so the fused output's
+     * per-constituent slice positions are deterministic. The cache key
+     * is the identity sequence; vanilla MC reuses the same set of
+     * interpolators across all chunks of a world so steady-state hit
+     * rate ≈ 100%.
+     *
+     * Returns null if any constituent's source CDF is unavailable (e.g.
+     * an older code path that didn't capture cdf). In that case the
+     * caller should fall back to the non-fused per-kernel dispatch path.
+     */
+    public static GpuFusedKernel getOrFuseAll(java.util.List<GpuCompiledKernel> compiledKernels) {
+        if (compiledKernels == null || compiledKernels.isEmpty()) return null;
+        for (GpuCompiledKernel ck : compiledKernels) {
+            if (ck == null || ck.cdf == null) return null;
+        }
+        FusedKey key = new FusedKey(compiledKernels);
+        return fusedKernelCache.computeIfAbsent(key, k -> {
+            GpuContext ctx = GpuContext.get();
+            if (ctx == null) return null;
+            java.util.List<CompiledDensityFunction> cdfs =
+                new java.util.ArrayList<>(compiledKernels.size());
+            for (GpuCompiledKernel ck : compiledKernels) {
+                cdfs.add(ck.cdf);
+            }
+            FusedDensityFunction fdf = DensityFunctionFuser.fuse(cdfs);
+            GpuFusedKernel result = GpuFusedKernel.upload(ctx, fdf);
+            GlassPaperBenchmark.recordFusedCompile(
+                compiledKernels.size(), fdf.flatIOps.length);
+            return result;
+        });
+    }
+
     private GpuKernelHolder() {}
 
     public static void set(GpuNoiseKernel kernel) { instance = kernel; }
@@ -150,5 +219,7 @@ public final class GpuKernelHolder {
         gpuKernelCache.values().forEach(GpuCompiledKernel::close);
         gpuKernelCache.clear();
         identityCache.clear();
+        fusedKernelCache.values().forEach(GpuFusedKernel::close);
+        fusedKernelCache.clear();
     }
 }

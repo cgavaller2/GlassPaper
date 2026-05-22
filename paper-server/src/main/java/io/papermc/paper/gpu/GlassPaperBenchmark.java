@@ -100,6 +100,23 @@ public final class GlassPaperBenchmark {
     public static void recordArgCacheHit()   { argCacheHits.incrementAndGet(); }
     public static void recordArgCacheMiss()  { argCacheMisses.incrementAndGet(); }
 
+    // Phase 9.14.B — fused-kernel compile + upload diagnostic. Each entry
+    // is one new fused kernel set being compiled and uploaded. Vanilla MC
+    // reuses the same interpolators so this should stabilize at a small
+    // number after warmup (~1-5 distinct sets per world).
+    private static final AtomicLong fusedCompiles      = new AtomicLong();
+    private static final AtomicLong fusedKernelsTotal  = new AtomicLong();
+    private static final AtomicLong fusedIOpsTotal     = new AtomicLong();
+    private static final AtomicLong fusedDispatches    = new AtomicLong();
+    private static final AtomicLong fusedFallbacks     = new AtomicLong();
+    public static void recordFusedCompile(int numKernels, int iOpsLen) {
+        fusedCompiles.incrementAndGet();
+        fusedKernelsTotal.addAndGet(numKernels);
+        fusedIOpsTotal.addAndGet(iOpsLen);
+    }
+    public static void recordFusedDispatch() { fusedDispatches.incrementAndGet(); }
+    public static void recordFusedFallback() { fusedFallbacks.incrementAndGet(); }
+
     private static final AtomicLong blendedFallbacks = new AtomicLong();
 
     public static void recordBlendedFallback() { blendedFallbacks.incrementAndGet(); }
@@ -469,6 +486,15 @@ public final class GlassPaperBenchmark {
                 argHits, argTotal, hitPct, argMisses));
         }
 
+        // Phase 9.14.B — fused dispatch metrics.
+        long fc = fusedCompiles.get(), fd = fusedDispatches.get(), ffb = fusedFallbacks.get();
+        if (fc + fd + ffb > 0) {
+            LOGGER.info(String.format(
+                "Fused dispatch  : %,d compiles (%d kernels total, %,d iOps total), "
+              + "%,d dispatches, %,d fallbacks",
+                fc, fusedKernelsTotal.get(), fusedIOpsTotal.get(), fd, ffb));
+        }
+
         long cmCalls = compileMissCalls.get(), chCalls = compileHitCalls.get();
         long idCalls = identityHitCalls.get();
         if (cmCalls + chCalls + idCalls > 0) {
@@ -557,6 +583,11 @@ public final class GlassPaperBenchmark {
         synchronized (batchLock) { largestBatch = 0; }
         argCacheHits.set(0);
         argCacheMisses.set(0);
+        fusedCompiles.set(0);
+        fusedKernelsTotal.set(0);
+        fusedIOpsTotal.set(0);
+        fusedDispatches.set(0);
+        fusedFallbacks.set(0);
         mismatches.clear();
         samplesChecked.clear();
         perTypeStats.clear();

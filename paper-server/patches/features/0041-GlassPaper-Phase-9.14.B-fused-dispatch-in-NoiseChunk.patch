@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cgavaller2 <cgavaller2@gmail.com>
+Date: Fri, 22 May 2026 15:32:06 -0500
+Subject: [PATCH] GlassPaper: Phase 9.14.B fused dispatch in
+ NoiseChunk.fillSliceGpu
+
+
+diff --git a/net/minecraft/world/level/levelgen/NoiseChunk.java b/net/minecraft/world/level/levelgen/NoiseChunk.java
+index e718a2942880ee8a29e9d4c58448ccb6a107f369..5d4e297469b4035856f8916706bb918c19aa7a25 100644
+--- a/net/minecraft/world/level/levelgen/NoiseChunk.java
++++ b/net/minecraft/world/level/levelgen/NoiseChunk.java
+@@ -322,6 +322,128 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
+             return;
+         }
+ 
++        // Phase 9.14.B — try fused dispatch first. Collects all GPU-eligible
++        // interpolators into a single fused kernel call, replacing N separate
++        // dispatches with 1. Amortizes the largest remaining bottleneck —
++        // per-dispatch host overhead — across N constituents.
++        //
++        // Fusion is skipped (falls through to per-kernel path) when:
++        //   - Only 1 interpolator is GPU-eligible (no benefit from fusion)
++        //   - Any constituent CDF is unavailable (older code path)
++        //   - GpuKernelHolder.getOrFuseAll returns null (compile/upload failure)
++        //   - The fused dispatch itself fails (signaled via callback failure)
++        boolean fusionEnabled = !Boolean.getBoolean("glasspaper.gpu.fusion.disable");
++        java.util.List<io.papermc.paper.gpu.GpuCompiledKernel> fuseList = null;
++        int[] fuseIndices = null;
++        int numFused = 0;
++        if (fusionEnabled && gpuKernel != null) {
++            fuseList = new java.util.ArrayList<>(this.interpolators.size());
++            fuseIndices = new int[this.interpolators.size()];
++            for (int i = 0; i < this.interpolators.size(); i++) {
++                if (compiledKernels[i] != null) {
++                    fuseIndices[numFused++] = i;
++                    fuseList.add(compiledKernels[i]);
++                }
++            }
++        }
++        if (fuseList != null && numFused >= 2) {
++            io.papermc.paper.gpu.GpuFusedKernel fk =
++                io.papermc.paper.gpu.GpuKernelHolder.getOrFuseAll(fuseList);
++            if (fk != null) {
++                final int finalNumFused = numFused;
++                final int[] finalFuseIndices = fuseIndices;
++                final java.util.concurrent.CompletableFuture<double[]> resultFuture =
++                    new java.util.concurrent.CompletableFuture<>();
++                long fusedStart = System.nanoTime();
++                gpuKernel.evalFusedAsync(positions, fk, pointsPerInterp,
++                    new io.papermc.paper.gpu.GpuNoiseKernel.AsyncCallback() {
++                        @Override
++                        public void onComplete(double[] hostResults, int totalOut) {
++                            // Copy out so we can release the ring buffer.
++                            // Per-interpolator slices are reconstructed below.
++                            double[] copy = new double[totalOut];
++                            System.arraycopy(hostResults, 0, copy, 0, totalOut);
++                            resultFuture.complete(copy);
++                        }
++                        @Override
++                        public void onFailure(Throwable cause) {
++                            resultFuture.complete(null);
++                        }
++                    });
++                io.papermc.paper.gpu.GlassPaperBenchmark.recordFusedDispatch();
++                double[] multi = null;
++                try {
++                    multi = resultFuture.get(100, java.util.concurrent.TimeUnit.MILLISECONDS);
++                } catch (Exception ignored) {
++                    multi = null;
++                }
++                if (multi != null) {
++                    // Record as ONE GPU dispatch for benchmarking (it is one
++                    // device dispatch, regardless of N constituent kernels).
++                    io.papermc.paper.gpu.GlassPaperBenchmark.recordGpu(
++                        System.nanoTime() - fusedStart, finalNumFused * pointsPerInterp);
++                    io.papermc.paper.gpu.GlassPaperBenchmark.recordBatchFlush(
++                        finalNumFused * pointsPerInterp);
++
++                    // Split multi-output into per-interpolator slices, then
++                    // copy into each interpolator's slice0/slice1.
++                    for (int k = 0; k < finalNumFused; k++) {
++                        int interpIdx = finalFuseIndices[k];
++                        NoiseChunk.NoiseInterpolator interp = this.interpolators.get(interpIdx);
++                        int offsetK = k * pointsPerInterp;
++                        for (int zi = 0; zi < zColumns; zi++) {
++                            double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                            System.arraycopy(multi, offsetK + zi * yLevels, slice, 0, yLevels);
++                        }
++                        // Runtime CPU/GPU validation, gated by gpuvalidate.
++                        if (io.papermc.paper.gpu.GlassPaperBenchmark.isValidating()) {
++                            DensityFunction validateFn = interp.wrapped();
++                            String typeName = validateFn.getClass().getSimpleName();
++                            for (int p = 0; p < pointsPerInterp; p += 16) {
++                                double px = positions[p * 3];
++                                double py = positions[p * 3 + 1];
++                                double pz = positions[p * 3 + 2];
++                                double cpuVal = validateFn.compute(
++                                    new DensityFunction.SinglePointContext((int) px, (int) py, (int) pz));
++                                double gpuVal = multi[offsetK + p];
++                                double delta = Math.abs(cpuVal - gpuVal);
++                                io.papermc.paper.gpu.GlassPaperBenchmark.recordSampleChecked(typeName);
++                                if (delta > 1e-6) {
++                                    io.papermc.paper.gpu.GlassPaperBenchmark.recordMismatch(
++                                        typeName, delta, (int) px, (int) py, (int) pz, cpuVal, gpuVal);
++                                    io.papermc.paper.gpu.GlassPaperBenchmark.diagnoseRangeChoice(
++                                        validateFn, px, py, pz, cpuVal, gpuVal);
++                                    io.papermc.paper.gpu.GlassPaperBenchmark.dumpCompiledBytecode(
++                                        typeName, validateFn);
++                                }
++                            }
++                        }
++                    }
++                    // Handle any non-GPU-eligible interpolators on CPU.
++                    for (int i = 0; i < this.interpolators.size(); i++) {
++                        if (compiledKernels[i] == null) {
++                            NoiseChunk.NoiseInterpolator interp = this.interpolators.get(i);
++                            for (int zi = 0; zi < zColumns; zi++) {
++                                double[] slice = (isSlice0 ? interp.slice0 : interp.slice1)[zi];
++                                int i1 = this.firstCellZ + zi;
++                                this.cellStartBlockZ = i1 * this.cellWidth;
++                                this.inCellZ = 0;
++                                long cpuStart = System.nanoTime();
++                                interp.fillArray(slice, this.sliceFillingContextProvider);
++                                io.papermc.paper.gpu.GlassPaperBenchmark.recordCpu(
++                                    System.nanoTime() - cpuStart);
++                            }
++                        }
++                    }
++                    this.arrayInterpolationCounter++;
++                    return;
++                }
++                // Fused dispatch failed (timeout or device error). Fall through
++                // to the per-kernel dispatch path below.
++                io.papermc.paper.gpu.GlassPaperBenchmark.recordFusedFallback();
++            }
++        }
++
+         // Submit ALL GPU-eligible interpolators upfront, then await results in
+         // a second pass. This puts every interpolator's work onto the dispatch
+         // queue simultaneously instead of serializing one-blocking-submit per

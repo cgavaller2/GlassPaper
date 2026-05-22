@@ -85,7 +85,13 @@ public final class GpuNoiseKernel {
      *              thread will eventually move it back to FREE
      */
     private static final class RingEntry {
-        final cl_kernel kernel;
+        final cl_kernel kernel;        // evalDensityTree (regular path)
+        // Phase 9.14.B — per-ring-entry fused-dispatch kernel object.
+        // Args 0 (posBuf) and 15 (outBuf) are slot-local — bound once at
+        // init. Args 1-14 (offset tables + 12 buffer ptrs from
+        // GpuFusedKernel) are cached against lastFusedKernel. Args 16
+        // (numKernels) and 17 (pointCount) vary per dispatch.
+        final cl_kernel fusedKernel;
         final cl_mem    posBuf;
         final cl_mem    outBuf;
 
@@ -107,7 +113,8 @@ public final class GpuNoiseKernel {
         final DoubleBuffer  outBufferAsDouble;
         final double[]      hostResults;  // copy target; sized to MAX_POOLED_POINTS
 
-        GpuCompiledKernel lastGpuKernel;  // Phase 9.12.A — per-ring-entry arg cache
+        GpuCompiledKernel lastGpuKernel;  // Phase 9.12.A — per-ring-entry arg cache for regular path
+        GpuFusedKernel    lastFusedKernel; // Phase 9.14.B — arg cache for fused path
 
         // In-flight state (mutated by dispatch thread under slot borrow,
         // read by completion thread). The handoff is via the completion
@@ -125,8 +132,9 @@ public final class GpuNoiseKernel {
         // null means the entry has never been used.
         volatile java.util.concurrent.CompletableFuture<Void> processed;
 
-        RingEntry(cl_kernel k, cl_mem pb, cl_mem ob) {
+        RingEntry(cl_kernel k, cl_kernel fk, cl_mem pb, cl_mem ob) {
             this.kernel      = k;
+            this.fusedKernel = fk;
             this.posBuf      = pb;
             this.outBuf      = ob;
             // Allocate direct off-heap ByteBuffer for the read DMA target.
@@ -313,15 +321,24 @@ public final class GpuNoiseKernel {
             RingEntry[] ring = new RingEntry[RING_DEPTH];
             for (int r = 0; r < RING_DEPTH; r++) {
                 cl_kernel rk = clCreateKernel(program, "evalDensityTree", null);
+                // Phase 9.14.B — per-ring-entry fused-dispatch kernel
+                cl_kernel rfk = clCreateKernel(program, "evalDensityTreeFused", null);
                 cl_mem rpb = clCreateBuffer(ctx.context(),
                     CL_MEM_READ_ONLY,
                     (long) Sizeof.cl_double * MAX_POOLED_POINTS * 3, null, null);
                 cl_mem rob = clCreateBuffer(ctx.context(),
                     CL_MEM_WRITE_ONLY,
                     (long) Sizeof.cl_double * MAX_POOLED_POINTS, null, null);
+                // Regular kernel: arg 0 (posBuf) and arg 13 (outBuf) bound once.
                 clSetKernelArg(rk,  0, Sizeof.cl_mem, Pointer.to(rpb));
                 clSetKernelArg(rk, 13, Sizeof.cl_mem, Pointer.to(rob));
-                ring[r] = new RingEntry(rk, rpb, rob);
+                // Fused kernel: arg 0 (posBuf) and arg 15 (outBuf) bound once.
+                // posBuf and outBuf are shared between the regular and fused
+                // paths — only one of the two paths uses any given ring entry
+                // at a time (each path borrows the slot exclusively).
+                clSetKernelArg(rfk,  0, Sizeof.cl_mem, Pointer.to(rpb));
+                clSetKernelArg(rfk, 15, Sizeof.cl_mem, Pointer.to(rob));
+                ring[r] = new RingEntry(rk, rfk, rpb, rob);
             }
 
             result.densityTreeSlotPool.add(new DensitySlot(dq, ring, dk, pb, ob));
@@ -763,6 +780,123 @@ public final class GpuNoiseKernel {
     }
 
     /**
+     * Phase 9.14.B — async fused dispatch.
+     *
+     * Same async pattern as {@link #evalDensityTreeAsync} (per-slot ring,
+     * non-blocking read, completion thread invokes callback), but binds the
+     * per-ring-entry fusedKernel instead of the regular kernel and dispatches
+     * numKernels × pointCount work items. The output buffer holds
+     * numKernels × pointCount doubles, laid out as
+     * [k0 results × pointCount][k1 results × pointCount][...].
+     *
+     * Caller's callback receives the full multi-output and is responsible
+     * for splitting it back into per-constituent slices.
+     *
+     * Falls back to a fresh-allocation sync dispatch if the multi-output
+     * exceeds MAX_POOLED_POINTS — keeps the ring slots' fixed-size buffers
+     * from being a hard cap on fusable kernel counts.
+     */
+    public void evalFusedAsync(double[] positions,
+                               GpuFusedKernel fk,
+                               int pointCount,
+                               AsyncCallback callback) {
+        int numKernels = fk.numKernels;
+        long totalOut = (long) numKernels * pointCount;
+        if (totalOut > MAX_POOLED_POINTS) {
+            // Oversize fallback: sync allocation. Rare in practice — vanilla
+            // MC has ~5 interpolators per slice × ~500 points ≈ 2500 outputs,
+            // well under the 32K cap. Hit this only with very large coalesced
+            // dispatches or unusual density-tree shapes.
+            double[] results = new double[(int) totalOut];
+            try {
+                evalFusedSync(positions, fk, pointCount, results);
+                callback.onComplete(results, (int) totalOut);
+            } catch (Throwable t) {
+                callback.onFailure(t);
+            }
+            return;
+        }
+
+        DensitySlot slot = borrowSlot();
+        boolean enqueued = false;
+        try {
+            int idx = slot.nextRingIndex;
+            slot.nextRingIndex = (idx + 1) % RING_DEPTH;
+            RingEntry entry = slot.ring[idx];
+
+            // Wait for prior use of this ring entry (regular or fused) to
+            // complete. Same handoff mechanism as evalDensityTreeAsync.
+            java.util.concurrent.CompletableFuture<Void> prevProcessed = entry.processed;
+            if (prevProcessed != null && !prevProcessed.isDone()) {
+                try {
+                    prevProcessed.get(5, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                        "Ring entry " + idx + " stuck in-flight (fused): " + e, e);
+                }
+            }
+
+            cl_kernel fused = entry.fusedKernel;
+            // Static-arg caching for fused path: args 1-14 (offset tables +
+            // 12 buffer ptrs from GpuFusedKernel) only rebind when the
+            // GpuFusedKernel identity changes.
+            if (entry.lastFusedKernel != fk) {
+                clSetKernelArg(fused,  1, Sizeof.cl_mem, Pointer.to(fk.iOpStartBuf));
+                clSetKernelArg(fused,  2, Sizeof.cl_mem, Pointer.to(fk.dArgStartBuf));
+                clSetKernelArg(fused,  3, Sizeof.cl_mem, Pointer.to(fk.flatIOpsBuf));
+                clSetKernelArg(fused,  4, Sizeof.cl_mem, Pointer.to(fk.flatDArgsBuf));
+                clSetKernelArg(fused,  5, Sizeof.cl_mem, Pointer.to(fk.flatNoiseParamsBuf));
+                clSetKernelArg(fused,  6, Sizeof.cl_mem, Pointer.to(fk.flatNoiseInfoBuf));
+                clSetKernelArg(fused,  7, Sizeof.cl_mem, Pointer.to(fk.flatOctaveParamsBuf));
+                clSetKernelArg(fused,  8, Sizeof.cl_mem, Pointer.to(fk.flatPermTablesBuf));
+                clSetKernelArg(fused,  9, Sizeof.cl_mem, Pointer.to(fk.flatSplineHeadersBuf));
+                clSetKernelArg(fused, 10, Sizeof.cl_mem, Pointer.to(fk.flatSplineFloatPoolBuf));
+                clSetKernelArg(fused, 11, Sizeof.cl_mem, Pointer.to(fk.flatSplineChildrenBuf));
+                clSetKernelArg(fused, 12, Sizeof.cl_mem, Pointer.to(fk.flatBlendedScalarsBuf));
+                clSetKernelArg(fused, 13, Sizeof.cl_mem, Pointer.to(fk.flatBlendedPerlinFactorsBuf));
+                clSetKernelArg(fused, 14, Sizeof.cl_mem, Pointer.to(fk.flatBlendedPerlinInfoBuf));
+                entry.lastFusedKernel = fk;
+                GlassPaperBenchmark.recordArgCacheMiss();
+            } else {
+                GlassPaperBenchmark.recordArgCacheHit();
+            }
+            // numKernels and pointCount vary per fused dispatch.
+            clSetKernelArg(fused, 16, Sizeof.cl_int, Pointer.to(new int[]{numKernels}));
+            clSetKernelArg(fused, 17, Sizeof.cl_int, Pointer.to(new int[]{pointCount}));
+
+            // pointCount in entry.pointCount = the read buffer's element count
+            // so the completion thread copies the right amount.
+            entry.pointCount   = (int) totalOut;
+            entry.callback     = callback;
+            entry.processed    = new java.util.concurrent.CompletableFuture<>();
+
+            cl_event readEv = new cl_event();
+            // CL_TRUE write — runtime captures host pointer in ~5-15 µs
+            // without waiting for prior queue commands.
+            clEnqueueWriteBuffer(slot.queue, entry.posBuf, CL_TRUE, 0,
+                (long) Sizeof.cl_double * pointCount * 3,
+                Pointer.to(positions), 0, null, null);
+            clEnqueueNDRangeKernel(slot.queue, fused, 1, null,
+                new long[]{roundUp((int) totalOut, densityLocalWorkSize)},
+                new long[]{densityLocalWorkSize}, 0, null, null);
+            entry.outBufferDirect.position(0);
+            clEnqueueReadBuffer(slot.queue, entry.outBuf, CL_FALSE, 0,
+                (long) Sizeof.cl_double * totalOut,
+                Pointer.to(entry.outBufferDirect), 0, null, readEv);
+
+            entry.readEvent = readEv;
+            pendingCompletions.add(new PendingCompletion(entry));
+            enqueued = true;
+        } finally {
+            returnSlot(slot);
+            if (!enqueued) {
+                try { callback.onFailure(new RuntimeException("fused dispatch aborted")); }
+                catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /**
      * Allocating overload — retained so the dispatchQueue==null fallback
      * in NoiseChunk.fillSliceGpu (and any other synchronous caller) stays
      * unchanged. The hot path uses the output-array form above.
@@ -1120,6 +1254,7 @@ public final class GpuNoiseKernel {
             // Phase 9.13 — ring entry resources
             for (RingEntry e : s.ring) {
                 clReleaseKernel(e.kernel);
+                clReleaseKernel(e.fusedKernel);  // Phase 9.14.B
                 clReleaseMemObject(e.posBuf);
                 clReleaseMemObject(e.outBuf);
             }

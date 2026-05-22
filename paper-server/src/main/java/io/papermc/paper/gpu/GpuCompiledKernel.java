@@ -18,7 +18,16 @@ public final class GpuCompiledKernel implements AutoCloseable {
     final cl_mem blendedPerlinFactorsBuf;
     final cl_mem blendedPerlinInfoBuf;
 
+    // Phase 9.14.B — retained reference to the source CDF so it can be
+    // re-fused with sibling kernels for a fused-dispatch slice fill. The
+    // CDF carries the raw bytecode + buffers needed for DensityFunctionFuser
+    // to re-index and concatenate. Kept reachable for the lifetime of this
+    // GpuCompiledKernel; ~10 KB per unique kernel × ~100 unique kernels per
+    // session ≈ ~1 MB extra retention. Negligible.
+    public final CompiledDensityFunction cdf;
+
     private GpuCompiledKernel(
+        CompiledDensityFunction cdf,
         cl_mem iOpsBuf, cl_mem dArgsBuf,
         cl_mem noiseParamsBuf, cl_mem noiseInfoBuf,
         cl_mem octaveParamsBuf, cl_mem permTablesBuf,
@@ -26,6 +35,7 @@ public final class GpuCompiledKernel implements AutoCloseable {
         cl_mem splineChildrenBuf,
         cl_mem blendedScalarsBuf, cl_mem blendedPerlinFactorsBuf,
         cl_mem blendedPerlinInfoBuf) {
+        this.cdf                    = cdf;
         this.iOpsBuf                = iOpsBuf;
         this.dArgsBuf               = dArgsBuf;
         this.noiseParamsBuf         = noiseParamsBuf;
@@ -42,6 +52,7 @@ public final class GpuCompiledKernel implements AutoCloseable {
 
     public static GpuCompiledKernel upload(GpuContext ctx, CompiledDensityFunction cdf) {
         return new GpuCompiledKernel(
+            cdf,
             buf(ctx, cdf.iOps.length > 0
                     ? Pointer.to(cdf.iOps) : Pointer.to(new int[1]),
                 (long) Sizeof.cl_int * Math.max(1, cdf.iOps.length)),
